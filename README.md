@@ -1,3 +1,8 @@
+OK - this fork is so that I can annotate cutdown chunks to bootstrap a raku binding
+
+
+
+vvvvvvvvvvv
 # Polars
 
 [![rust docs](https://docs.rs/polars/badge.svg)](https://docs.rs/polars/latest/polars/)
