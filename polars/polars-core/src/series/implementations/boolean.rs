@@ -16,7 +16,6 @@ use crate::frame::hash_join::ZipOuterJoinColumn;
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
 use ahash::RandomState;
-use arrow::array::ArrayRef;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use std::borrow::Cow;
 use std::ops::{BitAnd, BitOr, BitXor};
@@ -39,7 +38,7 @@ impl private::PrivateSeries for SeriesWrap<BooleanChunked> {
         self.0.explode_by_offsets(offsets)
     }
 
-    fn set_sorted(&mut self, reverse: bool) {
+    fn _set_sorted(&mut self, reverse: bool) {
         self.0.set_sorted(reverse)
     }
 
@@ -66,19 +65,19 @@ impl private::PrivateSeries for SeriesWrap<BooleanChunked> {
         self.0.vec_hash_combine(build_hasher, hashes)
     }
 
-    fn agg_min(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_min(groups)
     }
 
-    fn agg_max(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_max(groups)
     }
 
-    fn agg_sum(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_sum(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_sum(groups)
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_list(groups)
     }
 
@@ -148,10 +147,6 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
         self.0.shrink_to_fit()
     }
 
-    fn bool(&self) -> Result<&BooleanChunked> {
-        unsafe { Ok(&*(self as *const dyn SeriesTrait as *const BooleanChunked)) }
-    }
-
     fn append_array(&mut self, other: ArrayRef) -> Result<()> {
         self.0.append_array(other)
     }
@@ -191,8 +186,8 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-        self.0.take_chunked_unchecked(by).into_series()
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+        self.0.take_chunked_unchecked(by, sorted).into_series()
     }
 
     #[cfg(feature = "chunked_ids")]
@@ -302,8 +297,7 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
     }
 
     fn arg_true(&self) -> Result<IdxCa> {
-        let ca: &BooleanChunked = self.bool()?;
-        Ok(ca.arg_true())
+        Ok(self.0.arg_true())
     }
 
     fn is_null(&self) -> BooleanChunked {

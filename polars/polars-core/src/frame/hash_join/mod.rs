@@ -6,6 +6,7 @@ mod single_keys_left;
 mod single_keys_outer;
 #[cfg(feature = "semi_anti_join")]
 mod single_keys_semi_anti;
+pub(super) mod sort_merge;
 
 #[cfg(feature = "chunked_ids")]
 use arrow::Either;
@@ -26,6 +27,7 @@ use polars_arrow::utils::CustomIterTools;
 use crate::frame::hash_join::multiple_keys::{
     inner_join_multiple_keys, left_join_multiple_keys, outer_join_multiple_keys,
 };
+use sort_merge::*;
 
 #[cfg(feature = "semi_anti_join")]
 use crate::frame::hash_join::multiple_keys::{left_anti_multiple_keys, left_semi_multiple_keys};
@@ -97,6 +99,7 @@ macro_rules! det_hash_prone_order {
     }};
 }
 
+use crate::series::IsSorted;
 pub(super) use det_hash_prone_order;
 
 /// If Categorical types are created without a global string cache or under
@@ -135,15 +138,12 @@ pub(crate) unsafe fn get_hash_tbl_threaded_join_partitioned<Item>(
     hash_tables: &[Item],
     len: u64,
 ) -> &Item {
-    let mut idx = 0;
     for i in 0..len {
-        // can only be done for powers of two.
-        // n % 2^i = n & (2^i - 1)
-        if (h + i) & (len - 1) == 0 {
-            idx = i as usize;
+        if this_partition(h, i, len) {
+            return hash_tables.get_unchecked(i as usize);
         }
     }
-    hash_tables.get_unchecked(idx)
+    unreachable!()
 }
 
 #[allow(clippy::type_complexity)]
@@ -152,15 +152,12 @@ unsafe fn get_hash_tbl_threaded_join_mut_partitioned<T, H>(
     hash_tables: &mut [HashMap<T, (bool, Vec<IdxSize>), H>],
     len: u64,
 ) -> &mut HashMap<T, (bool, Vec<IdxSize>), H> {
-    let mut idx = 0;
     for i in 0..len {
-        // can only be done for powers of two.
-        // n % 2^i = n & (2^i - 1)
-        if (h + i) & (len - 1) == 0 {
-            idx = i as usize;
+        if this_partition(h, i, len) {
+            return hash_tables.get_unchecked_mut(i as usize);
         }
     }
-    hash_tables.get_unchecked_mut(idx)
+    unreachable!()
 }
 
 pub trait ZipOuterJoinColumn {
@@ -308,7 +305,8 @@ impl DataFrame {
         if left_join && chunk_ids.len() == self.height() {
             self.clone()
         } else {
-            self.take_chunked_unchecked(chunk_ids)
+            // left join keys are in ascending order
+            self.take_chunked_unchecked(chunk_ids, IsSorted::Ascending)
         }
     }
 
@@ -322,7 +320,7 @@ impl DataFrame {
         if left_join && join_tuples.len() == self.height() {
             self.clone()
         } else {
-            self.take_unchecked_slice(join_tuples)
+            self._take_unchecked_slice(join_tuples, true)
         }
     }
 
@@ -497,7 +495,8 @@ impl DataFrame {
                     || unsafe { self.create_left_df_from_slice(join_idx_left, false) },
                     || unsafe {
                         // remove join columns
-                        remove_selected(other, &selected_right).take_unchecked_slice(join_idx_right)
+                        remove_selected(other, &selected_right)
+                            ._take_unchecked_slice(join_idx_right, true)
                     },
                 );
                 self.finish_join(df_left, df_right, suffix)
@@ -666,7 +665,12 @@ impl DataFrame {
         #[cfg(feature = "dtype-categorical")]
         check_categorical_src(s_left.dtype(), s_right.dtype())?;
 
-        let (join_tuples_left, join_tuples_right) = s_left.hash_join_inner(s_right);
+        let (join_tuples_left, join_tuples_right) = if use_sort_merge(s_left, s_right) {
+            par_sorted_merge_inner(s_left, s_right)
+        } else {
+            s_left.hash_join_inner(s_right)
+        };
+
         let mut join_tuples_left = &*join_tuples_left;
         let mut join_tuples_right = &*join_tuples_right;
 
@@ -682,7 +686,7 @@ impl DataFrame {
                 other
                     .drop(s_right.name())
                     .unwrap()
-                    .take_unchecked_slice(join_tuples_right)
+                    ._take_unchecked_slice(join_tuples_right, true)
             },
         );
         self.finish_join(df_left, df_right, suffix)
@@ -825,7 +829,21 @@ impl DataFrame {
         #[cfg(feature = "dtype-categorical")]
         check_categorical_src(s_left.dtype(), s_right.dtype())?;
 
-        let ids = s_left.hash_join_left(s_right);
+        let ids = if use_sort_merge(s_left, s_right) {
+            let (left_idx, right_idx) = par_sorted_merge_left(s_left, s_right);
+            #[cfg(feature = "chunked_ids")]
+            {
+                (Either::Left(left_idx), Either::Left(right_idx))
+            }
+
+            #[cfg(not(feature = "chunked_ids"))]
+            {
+                (left_idx, right_idx)
+            }
+        } else {
+            s_left.hash_join_left(s_right)
+        };
+
         self.finish_left_join(ids, &other.drop(s_right.name()).unwrap(), suffix, slice)
     }
 
@@ -840,7 +858,7 @@ impl DataFrame {
         if let Some((offset, len)) = slice {
             idx = slice_slice(idx, offset, len);
         }
-        self.take_unchecked_slice(idx)
+        self._take_unchecked_slice(idx, true)
     }
 
     #[cfg(feature = "semi_anti_join")]
@@ -924,7 +942,7 @@ impl DataFrame {
             #[cfg(feature = "dtype-categorical")]
             DataType::Categorical(_) => {
                 let ca_left = s_left.categorical().unwrap();
-                let new_rev_map = ca_left.merge_categorical_map(s_right.categorical().unwrap());
+                let new_rev_map = ca_left.merge_categorical_map(s_right.categorical().unwrap())?;
                 let logical = s.u32().unwrap().clone();
                 CategoricalChunked::from_cats_and_rev_map(logical, new_rev_map).into_series()
             }

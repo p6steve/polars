@@ -5,8 +5,8 @@ use crate::frame::groupby::{GroupsProxy, IntoGroupsProxy};
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
 use crate::series::private::{PrivateSeries, PrivateSeriesNumeric};
+use crate::series::IsSorted;
 use ahash::RandomState;
-use arrow::array::ArrayRef;
 use std::any::Any;
 use std::borrow::Cow;
 
@@ -38,7 +38,7 @@ where
         Cow::Borrowed(self.0.ref_field())
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_list(groups)
     }
 
@@ -116,8 +116,8 @@ where
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-        self.0.take_chunked_unchecked(by).into_series()
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+        self.0.take_chunked_unchecked(by, sorted).into_series()
     }
 
     #[cfg(feature = "chunked_ids")]

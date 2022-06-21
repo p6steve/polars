@@ -59,7 +59,7 @@ impl JsExpr {
                 .map_err(|err| napi::Error::from_reason(format!("{:?}", err)))?,
             _ => {
                 return Err(napi::Error::from_reason(
-                    "unexpected format. \n supportd options are 'json', 'bincode'".to_owned(),
+                    "unexpected format. \n supported options are 'json', 'bincode'".to_owned(),
                 ))
             }
         };
@@ -83,7 +83,7 @@ impl JsExpr {
                 .map_err(|err| napi::Error::from_reason(format!("{:?}", err)))?,
             _ => {
                 return Err(napi::Error::from_reason(
-                    "unexpected format. \n supportd options are 'json', 'bincode'".to_owned(),
+                    "unexpected format. \n supported options are 'json', 'bincode'".to_owned(),
                 ))
             }
         };
@@ -328,12 +328,12 @@ impl JsExpr {
     }
     #[napi]
     pub fn backward_fill(&self) -> JsExpr {
-        self.clone().inner.backward_fill().into()
+        self.clone().inner.backward_fill(None).into()
     }
 
     #[napi]
     pub fn forward_fill(&self) -> JsExpr {
-        self.clone().inner.forward_fill().into()
+        self.clone().inner.forward_fill(None).into()
     }
 
     #[napi]
@@ -1184,11 +1184,17 @@ impl JsExpr {
     }
 
     #[napi]
-    pub fn sample_frac(&self, frac: f64, with_replacement: bool, seed: Option<i64>) -> JsExpr {
+    pub fn sample_frac(
+        &self,
+        frac: f64,
+        with_replacement: bool,
+        shuffle: bool,
+        seed: Option<i64>,
+    ) -> JsExpr {
         let seed = seed.map(|s| s as u64);
         self.inner
             .clone()
-            .sample_frac(frac, with_replacement, seed)
+            .sample_frac(frac, with_replacement, shuffle, seed)
             .into()
     }
     #[napi]
@@ -1251,8 +1257,8 @@ impl JsExpr {
         self.inner.clone().log(base).into()
     }
     #[napi]
-    pub fn entropy(&self, base: f64) -> JsExpr {
-        self.inner.clone().entropy(base).into()
+    pub fn entropy(&self, base: f64, normalize: bool) -> JsExpr {
+        self.inner.clone().entropy(base, normalize).into()
     }
     #[napi]
     pub fn add(&self, rhs: &JsExpr) -> JsExpr {

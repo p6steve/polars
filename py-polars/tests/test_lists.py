@@ -1,3 +1,5 @@
+from datetime import date, datetime, time
+
 import pandas as pd
 from test_series import verify_series_and_expr_api
 
@@ -28,6 +30,20 @@ def test_list_arr_get() -> None:
     expected = pl.Series("a", [1, None, 7])
     testing.assert_series_equal(out, expected)
 
+    assert pl.DataFrame(
+        {"a": [[1], [2], [3], [4, 5, 6], [7, 8, 9], [None, 11]]}
+    ).with_columns(
+        [pl.col("a").arr.get(i).alias(f"get_{i}") for i in range(4)]
+    ).to_dict(
+        False
+    ) == {
+        "a": [[1], [2], [3], [4, 5, 6], [7, 8, 9], [None, 11]],
+        "get_0": [1, 2, 3, 4, 7, None],
+        "get_1": [None, None, None, 5, 8, 11],
+        "get_2": [None, None, None, 6, 9, None],
+        "get_3": [None, None, None, None, None, None],
+    }
+
 
 def test_contains() -> None:
     a = pl.Series("a", [[1, 2, 3], [2, 5], [6, 7, 8, 9]])
@@ -40,9 +56,42 @@ def test_contains() -> None:
 
 
 def test_dtype() -> None:
+    # inferred
     a = pl.Series("a", [[1, 2, 3], [2, 5], [6, 7, 8, 9]])
     assert a.dtype == pl.List
     assert a.inner_dtype == pl.Int64
+    assert getattr(a.dtype, "inner") == pl.Int64
+
+    # explicit
+    df = pl.DataFrame(
+        data={
+            "i": [[1, 2, 3]],
+            "tm": [[time(10, 30, 45)]],
+            "dt": [[date(2022, 12, 31)]],
+            "dtm": [[datetime(2022, 12, 31, 1, 2, 3)]],
+        },
+        columns=[  # type: ignore
+            ["i", pl.List(pl.Int8)],
+            ["tm", pl.List(pl.Time)],
+            ["dt", pl.List(pl.Date)],
+            ["dtm", pl.List(pl.Datetime)],
+        ],
+    )
+    assert df.schema == {
+        "i": pl.List(pl.Int8),
+        "tm": pl.List(pl.Time),
+        "dt": pl.List(pl.Date),
+        "dtm": pl.List(pl.Datetime),
+    }
+    assert getattr(df.schema["i"], "inner") == pl.Int8
+    assert df.rows() == [
+        (
+            [1, 2, 3],
+            [time(10, 30, 45)],
+            [date(2022, 12, 31)],
+            [datetime(2022, 12, 31, 1, 2, 3)],
+        )
+    ]
 
 
 def test_categorical() -> None:
@@ -74,7 +123,7 @@ def test_categorical() -> None:
 def test_list_concat_rolling_window() -> None:
     # inspired by: https://stackoverflow.com/questions/70377100/use-the-rolling-function-of-polars-to-get-a-list-of-all-values-in-the-rolling-wi
     # this tests if it works without specifically creating list dtype upfront.
-    # note that the given answer is prefered over this snippet as that reuses the list array when shifting
+    # note that the given answer is preferred over this snippet as that reuses the list array when shifting
     df = pl.DataFrame(
         {
             "A": [1.0, 2.0, 9.0, 2.0, 13.0],
@@ -196,7 +245,7 @@ def test_list_eval_dtype_inference() -> None:
         }
     )
 
-    rank_pct = pl.col("").rank(reverse=True) / pl.col("").count()
+    rank_pct = pl.col("").rank(reverse=True) / pl.col("").count().cast(pl.UInt16)
 
     # the .arr.first() would fail if .arr.eval did not correctly infer the output type
     assert grades.with_column(
@@ -214,3 +263,117 @@ def test_list_eval_dtype_inference() -> None:
         0.6666666865348816,
         0.3333333432674408,
     ]
+
+
+def test_list_empty_groupby_result_3521() -> None:
+    # Create a left relation where the join column contains a null value
+    left = pl.DataFrame().with_columns(
+        [
+            pl.lit(1).alias("groupby_column"),
+            pl.lit(None).cast(pl.Int32).alias("join_column"),
+        ]
+    )
+
+    # Create a right relation where there is a column to count distinct on
+    right = pl.DataFrame().with_columns(
+        [
+            pl.lit(1).alias("join_column"),
+            pl.lit(1).alias("n_unique_column"),
+        ]
+    )
+
+    # Calculate n_unique after dropping nulls
+    # This will panic on polars version 0.13.38 and 0.13.39
+    assert (
+        left.join(right, on="join_column", how="left")
+        .groupby("groupby_column")
+        .agg(pl.col("n_unique_column").drop_nulls())
+    ).to_dict(False) == {"groupby_column": [1], "n_unique_column": [[]]}
+
+
+def test_list_fill_null() -> None:
+    df = pl.DataFrame({"C": [["a", "b", "c"], [], [], ["d", "e"]]})
+    assert df.with_columns(
+        [
+            pl.when(pl.col("C").arr.lengths() == 0)
+            .then(None)
+            .otherwise(pl.col("C"))
+            .alias("C")
+        ]
+    ).to_series().to_list() == [["a", "b", "c"], None, None, ["d", "e"]]
+
+
+def test_list_fill_list() -> None:
+    assert pl.DataFrame({"a": [[1, 2, 3], []]}).select(
+        [
+            pl.when(pl.col("a").arr.lengths() == 0)
+            .then([5])
+            .otherwise(pl.col("a"))
+            .alias("filled")
+        ]
+    ).to_dict(False) == {"filled": [[1, 2, 3], [5]]}
+
+
+def test_empty_list_construction() -> None:
+    assert pl.Series([[]]).to_list() == [[]]
+    assert pl.DataFrame([{"array": [], "not_array": 1234}], orient="row").to_dict(
+        False
+    ) == {"array": [[]], "not_array": [1234]}
+
+    df = pl.DataFrame(columns=[("col", pl.List)])
+    assert df.schema == {"col": pl.List}
+    assert df.rows() == []
+
+
+def test_list_ternary_concat() -> None:
+    df = pl.DataFrame(
+        {
+            "list1": [["123", "456"], None],
+            "list2": [["789"], ["zzz"]],
+        }
+    )
+
+    assert df.with_column(
+        pl.when(pl.col("list1").is_null())
+        .then(pl.col("list1").arr.concat(pl.col("list2")))
+        .otherwise(pl.col("list2"))
+        .alias("result")
+    ).to_dict(False) == {
+        "list1": [["123", "456"], None],
+        "list2": [["789"], ["zzz"]],
+        "result": [["789"], None],
+    }
+
+    assert df.with_column(
+        pl.when(pl.col("list1").is_null())
+        .then(pl.col("list2"))
+        .otherwise(pl.col("list1").arr.concat(pl.col("list2")))
+        .alias("result")
+    ).to_dict(False) == {
+        "list1": [["123", "456"], None],
+        "list2": [["789"], ["zzz"]],
+        "result": [["123", "456", "789"], ["zzz"]],
+    }
+
+
+def test_list_concat_nulls() -> None:
+    assert pl.DataFrame(
+        {
+            "a": [["a", "b"], None, ["c", "d", "e"], None],
+            "t": [["x"], ["y"], None, None],
+        }
+    ).with_column(pl.concat_list(["a", "t"]).alias("concat"))["concat"].to_list() == [
+        ["a", "b", "x"],
+        None,
+        None,
+        None,
+    ]
+
+
+def test_list_concat_supertype() -> None:
+    df = pl.DataFrame(
+        [pl.Series("a", [1, 2], pl.UInt8), pl.Series("b", [10000, 20000], pl.UInt16)]
+    )
+    assert df.with_column(pl.concat_list(pl.col(["a", "b"])).alias("concat_list"))[
+        "concat_list"
+    ].to_list() == [[1, 10000], [2, 20000]]

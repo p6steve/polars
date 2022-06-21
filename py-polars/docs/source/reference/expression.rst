@@ -13,6 +13,7 @@ These functions can be used as expression and sometimes also in eager contexts.
 
    select
    col
+   element
    count
    list
    std
@@ -126,6 +127,7 @@ Computations
     Expr.cummax
     Expr.cumprod
     Expr.cumcount
+    Expr.cumulative_eval
     Expr.dot
     Expr.mode
     Expr.n_unique
@@ -175,6 +177,7 @@ Manipulation/ selection
 
     Expr.inspect
     Expr.slice
+    Expr.append
     Expr.explode
     Expr.flatten
     Expr.take_every
@@ -202,6 +205,7 @@ Manipulation/ selection
     Expr.reinterpret
     Expr.drop_nulls
     Expr.drop_nans
+    Expr.rechunk
     Expr.interpolate
     Expr.arg_sort
     Expr.clip
@@ -245,6 +249,13 @@ Window
    :toctree: api/
 
     Expr.over
+
+Various
+--------
+.. autosummary::
+   :toctree: api/
+
+    Expr.set_sorted
 
 TimeSeries
 ----------
@@ -302,9 +313,14 @@ The following methods are available under the `Expr.str` attribute.
     ExprStringNameSpace.strip
     ExprStringNameSpace.lstrip
     ExprStringNameSpace.rstrip
+    ExprStringNameSpace.zfill
+    ExprStringNameSpace.ljust
+    ExprStringNameSpace.rjust
     ExprStringNameSpace.contains
     ExprStringNameSpace.json_path_match
     ExprStringNameSpace.extract
+    ExprStringNameSpace.extract_all
+    ExprStringNameSpace.count_match
     ExprStringNameSpace.split
     ExprStringNameSpace.split_exact
     ExprStringNameSpace.replace
@@ -343,6 +359,7 @@ The following methods are available under the `expr.arr` attribute.
     ExprListNameSpace.slice
     ExprListNameSpace.head
     ExprListNameSpace.tail
+    ExprListNameSpace.to_struct
     ExprListNameSpace.eval
 
 Categories

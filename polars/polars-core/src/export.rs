@@ -3,6 +3,11 @@ pub use arrow;
 pub use chrono;
 
 #[cfg(feature = "private")]
-pub use lazy_static;
+pub use num;
+#[cfg(feature = "private")]
+pub use once_cell;
 #[cfg(feature = "private")]
 pub use rayon;
+#[cfg(feature = "private")]
+#[cfg(any(feature = "strings", feature = "temporal"))]
+pub use regex;

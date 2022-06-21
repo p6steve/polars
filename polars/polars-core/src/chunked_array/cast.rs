@@ -2,20 +2,38 @@
 #[cfg(feature = "dtype-categorical")]
 use crate::chunked_array::categorical::CategoricalChunkedBuilder;
 use crate::prelude::*;
+use arrow::compute::cast::CastOptions;
 use polars_arrow::compute::cast;
 use std::convert::TryFrom;
 
-pub(crate) fn cast_chunks(chunks: &[ArrayRef], dtype: &DataType) -> Result<Vec<ArrayRef>> {
+pub(crate) fn cast_chunks(
+    chunks: &[ArrayRef],
+    dtype: &DataType,
+    checked: bool,
+) -> Result<Vec<ArrayRef>> {
+    let options = if checked {
+        Default::default()
+    } else {
+        CastOptions {
+            wrapped: true,
+            partial: false,
+        }
+    };
+
     let chunks = chunks
         .iter()
-        .map(|arr| cast::cast(arr.as_ref(), &dtype.to_arrow()))
-        .map(|arr| arr.map(|x| x.into()))
+        .map(|arr| arrow::compute::cast::cast(arr.as_ref(), &dtype.to_arrow(), options))
         .collect::<arrow::error::Result<Vec<_>>>()?;
     Ok(chunks)
 }
 
-fn cast_impl(name: &str, chunks: &[ArrayRef], dtype: &DataType) -> Result<Series> {
-    let chunks = cast_chunks(chunks, &dtype.to_physical())?;
+fn cast_impl_inner(
+    name: &str,
+    chunks: &[ArrayRef],
+    dtype: &DataType,
+    checked: bool,
+) -> Result<Series> {
+    let chunks = cast_chunks(chunks, &dtype.to_physical(), checked)?;
     let out = Series::try_from((name, chunks))?;
     use DataType::*;
     let out = match dtype {
@@ -30,18 +48,51 @@ fn cast_impl(name: &str, chunks: &[ArrayRef], dtype: &DataType) -> Result<Series
     Ok(out)
 }
 
-impl<T> ChunkCast for ChunkedArray<T>
+fn cast_impl(name: &str, chunks: &[ArrayRef], dtype: &DataType) -> Result<Series> {
+    cast_impl_inner(name, chunks, dtype, true)
+}
+
+impl<T> ChunkedArray<T>
 where
     T: PolarsNumericType,
 {
-    fn cast(&self, data_type: &DataType) -> Result<Series> {
+    fn cast_impl(&self, data_type: &DataType, checked: bool) -> Result<Series> {
         match data_type {
             #[cfg(feature = "dtype-categorical")]
             DataType::Categorical(_) => {
                 Ok(CategoricalChunked::full_null(self.name(), self.len()).into_series())
             }
-            _ => cast_impl(self.name(), &self.chunks, data_type),
+            _ => cast_impl_inner(self.name(), &self.chunks, data_type, checked).map(|mut s| {
+                // maintain sorted if data types remain signed
+                if self.is_sorted()
+                    || self.is_sorted_reverse() && (s.null_count() == self.null_count())
+                {
+                    // this may still fail with overflow?
+                    //
+                    if (self.dtype().is_signed() && data_type.is_signed())
+                        || (self.dtype().is_unsigned() && data_type.is_unsigned())
+                    {
+                        let reverse = self.is_sorted_reverse();
+                        let inner = s._get_inner_mut();
+                        inner._set_sorted(reverse)
+                    }
+                }
+                s
+            }),
         }
+    }
+}
+
+impl<T> ChunkCast for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+{
+    fn cast(&self, data_type: &DataType) -> Result<Series> {
+        self.cast_impl(data_type, true)
+    }
+
+    fn cast_unchecked(&self, data_type: &DataType) -> Result<Series> {
+        self.cast_impl(data_type, false)
     }
 }
 
@@ -58,6 +109,10 @@ impl ChunkCast for Utf8Chunked {
             }
             _ => cast_impl(self.name(), &self.chunks, data_type),
         }
+    }
+
+    fn cast_unchecked(&self, data_type: &DataType) -> Result<Series> {
+        self.cast(data_type)
     }
 }
 
@@ -81,16 +136,24 @@ impl ChunkCast for BooleanChunked {
             cast_impl(self.name(), &self.chunks, data_type)
         }
     }
+
+    fn cast_unchecked(&self, data_type: &DataType) -> Result<Series> {
+        self.cast(data_type)
+    }
 }
 
 fn cast_inner_list_type(list: &ListArray<i64>, child_type: &DataType) -> Result<ArrayRef> {
     let child = list.values();
     let offsets = list.offsets();
-    let child = cast::cast(child.as_ref(), &child_type.to_arrow())?.into();
+    let child = cast::cast(child.as_ref(), &child_type.to_arrow())?;
 
     let data_type = ListArray::<i64>::default_datatype(child_type.to_arrow());
-    let list = ListArray::from_data(data_type, offsets.clone(), child, list.validity().cloned());
-    Ok(Arc::new(list) as ArrayRef)
+    // Safety:
+    // offsets are correct as they have not changed
+    let list = unsafe {
+        ListArray::new_unchecked(data_type, offsets.clone(), child, list.validity().cloned())
+    };
+    Ok(Box::new(list) as ArrayRef)
 }
 
 /// We cannot cast anything to or from List/LargeList
@@ -114,6 +177,10 @@ impl ChunkCast for ListChunked {
             _ => Err(PolarsError::ComputeError("Cannot cast list type".into())),
         }
     }
+
+    fn cast_unchecked(&self, data_type: &DataType) -> Result<Series> {
+        self.cast(data_type)
+    }
 }
 
 #[cfg(test)]
@@ -122,7 +189,8 @@ mod test {
 
     #[test]
     fn test_cast_list() -> Result<()> {
-        let mut builder = ListPrimitiveChunkedBuilder::<i32>::new("a", 10, 10, DataType::Int32);
+        let mut builder =
+            ListPrimitiveChunkedBuilder::<Int32Type>::new("a", 10, 10, DataType::Int32);
         builder.append_slice(Some(&[1i32, 2, 3]));
         builder.append_slice(Some(&[1i32, 2, 3]));
         let ca = builder.finish();

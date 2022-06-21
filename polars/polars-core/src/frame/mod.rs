@@ -12,6 +12,9 @@ use crate::chunked_array::ops::unique::is_unique_helper;
 use crate::prelude::*;
 use crate::utils::{get_supertype, split_ca, split_df, NoNull};
 
+#[cfg(feature = "describe")]
+use crate::utils::concat_df;
+
 #[cfg(feature = "dataframe_arithmetic")]
 mod arithmetic;
 #[cfg(feature = "asof_join")]
@@ -37,6 +40,7 @@ use crate::POOL;
 use serde::{Deserialize, Serialize};
 use std::hash::{BuildHasher, Hash, Hasher};
 
+use crate::series::IsSorted;
 pub use chunks::*;
 
 #[derive(Copy, Clone, Debug)]
@@ -324,13 +328,13 @@ impl DataFrame {
     pub fn with_row_count(&self, name: &str, offset: Option<IdxSize>) -> Result<Self> {
         let mut columns = Vec::with_capacity(self.columns.len() + 1);
         let offset = offset.unwrap_or(0);
-        columns.push(
-            IdxCa::from_vec(
-                name,
-                (offset..(self.height() as IdxSize) + offset).collect(),
-            )
-            .into_series(),
+
+        let mut ca = IdxCa::from_vec(
+            name,
+            (offset..(self.height() as IdxSize) + offset).collect(),
         );
+        ca.set_sorted(false);
+        columns.push(ca.into_series());
 
         columns.extend_from_slice(&self.columns);
         DataFrame::new(columns)
@@ -339,14 +343,13 @@ impl DataFrame {
     /// Add a row count in place.
     pub fn with_row_count_mut(&mut self, name: &str, offset: Option<IdxSize>) -> &mut Self {
         let offset = offset.unwrap_or(0);
-        self.columns.insert(
-            0,
-            IdxCa::from_vec(
-                name,
-                (offset..(self.height() as IdxSize) + offset).collect(),
-            )
-            .into_series(),
+        let mut ca = IdxCa::from_vec(
+            name,
+            (offset..(self.height() as IdxSize) + offset).collect(),
         );
+        ca.set_sorted(false);
+
+        self.columns.insert(0, ca.into_series());
         self
     }
 
@@ -390,7 +393,9 @@ impl DataFrame {
     /// Aggregate all the chunks in the DataFrame to a single chunk in parallel.
     /// This may lead to more peak memory consumption.
     pub fn as_single_chunk_par(&mut self) -> &mut Self {
-        self.columns = self.apply_columns_par(&|s| s.rechunk());
+        if self.columns.iter().any(|s| s.n_chunks() > 1) {
+            self.columns = self.apply_columns_par(&|s| s.rechunk());
+        }
         self
     }
 
@@ -476,6 +481,7 @@ impl DataFrame {
     }
 
     #[cfg(feature = "private")]
+    #[inline]
     pub fn get_columns_mut(&mut self) -> &mut Vec<Series> {
         &mut self.columns
     }
@@ -861,6 +867,11 @@ impl DataFrame {
     /// ```
     pub fn vstack_mut(&mut self, other: &DataFrame) -> Result<&mut Self> {
         if self.width() != other.width() {
+            if self.width() == 0 {
+                self.columns = other.columns.clone();
+                return Ok(self);
+            }
+
             return Err(PolarsError::ShapeMisMatch(
                 format!("Could not vertically stack DataFrame. The DataFrames appended width {} differs from the parent DataFrames width {}", self.width(), other.width()).into()
             ));
@@ -1609,12 +1620,23 @@ impl DataFrame {
     }
 
     pub(crate) unsafe fn take_unchecked(&self, idx: &IdxCa) -> Self {
-        let cols = POOL.install(|| {
-            self.apply_columns_par(&|s| match s.dtype() {
-                DataType::Utf8 => s.take_unchecked_threaded(idx, true).unwrap(),
-                _ => s.take_unchecked(idx).unwrap(),
+        self.take_unchecked_impl(idx, true)
+    }
+
+    unsafe fn take_unchecked_impl(&self, idx: &IdxCa, allow_threads: bool) -> Self {
+        let cols = if allow_threads {
+            POOL.install(|| {
+                self.apply_columns_par(&|s| match s.dtype() {
+                    DataType::Utf8 => s.take_unchecked_threaded(idx, true).unwrap(),
+                    _ => s.take_unchecked(idx).unwrap(),
+                })
             })
-        });
+        } else {
+            self.columns
+                .iter()
+                .map(|s| s.take_unchecked(idx).unwrap())
+                .collect()
+        };
         DataFrame::new_no_checks(cols)
     }
 
@@ -1677,7 +1699,7 @@ impl DataFrame {
         reverse: impl IntoVec<bool>,
     ) -> Result<&mut Self> {
         // a lot of indirection in both sorting and take
-        self.rechunk();
+        self.as_single_chunk_par();
         let by_column = self.select_series(by_column)?;
         let reverse = reverse.into_vec();
         self.columns = self.sort_impl(by_column, reverse, false, None)?.columns;
@@ -1703,10 +1725,17 @@ impl DataFrame {
         let mut take = match by_column.len() {
             1 => {
                 let s = &by_column[0];
-                s.argsort(SortOptions {
+                let options = SortOptions {
                     descending: reverse[0],
                     nulls_last,
-                })
+                };
+                // fast path for a frame with a single series
+                // no need to compute the sort indices and then take by these indices
+                // simply sort and return as frame
+                if self.width() == 1 && self.check_name_to_idx(s.name()).is_ok() {
+                    return Ok(s.sort_with(options).into_frame());
+                }
+                s.argsort(options)
             }
             _ => {
                 #[cfg(feature = "sort_multiple")]
@@ -1737,8 +1766,7 @@ impl DataFrame {
         // not present in the dataframe
         let _ = df.apply(&first_by_column, |s| {
             let mut s = s.clone();
-            let inner = s.get_inner_mut();
-            inner.set_sorted(first_reverse);
+            s.set_sorted(first_reverse);
             s
         });
         Ok(df)
@@ -1772,7 +1800,7 @@ impl DataFrame {
     pub fn sort_with_options(&self, by_column: &str, options: SortOptions) -> Result<Self> {
         let mut df = self.clone();
         // a lot of indirection in both sorting and take
-        df.rechunk();
+        df.as_single_chunk_par();
         let by_column = vec![df.column(by_column)?.clone()];
         let reverse = vec![options.descending];
         df.columns = df
@@ -2259,6 +2287,106 @@ impl DataFrame {
         let col = self.try_apply_columns_par(&|s| s.fill_null(strategy))?;
 
         Ok(DataFrame::new_no_checks(col))
+    }
+
+    /// Summary statistics for a DataFrame. Only summarizes numeric datatypes at the moment and returns nulls for non numeric datatypes.
+    /// Try in keep output similar to pandas
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use polars_core::prelude::*;
+    /// let df1: DataFrame = df!("categorical" => &["d","e","f"],
+    ///                          "numeric" => &[1, 2, 3],
+    ///                          "object" => &["a", "b", "c"])?;
+    /// assert_eq!(df1.shape(), (3, 3));
+    ///
+    /// let df2: DataFrame = df1.describe(None);
+    /// assert_eq!(df2.shape(), (8, 4));
+    /// println!("{}", df2);
+    /// # Ok::<(), PolarsError>(())
+    /// ```
+    ///
+    /// Output:
+    ///
+    /// ```text
+    /// shape: (8, 4)
+    /// ┌──────────┬─────────────┬─────────┬────────┐
+    /// │ describe ┆ categorical ┆ numeric ┆ object │
+    /// │ ---      ┆ ---         ┆ ---     ┆ ---    │
+    /// │ str      ┆ f64         ┆ f64     ┆ f64    │
+    /// ╞══════════╪═════════════╪═════════╪════════╡
+    /// │ count    ┆ 3.0         ┆ 3.0     ┆ 3.0    │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ mean     ┆ null        ┆ 2.0     ┆ null   │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ std      ┆ null        ┆ 1.0     ┆ null   │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ min      ┆ null        ┆ 1.0     ┆ null   │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ 0.25%    ┆ null        ┆ 1.5     ┆ null   │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ 0.5%     ┆ null        ┆ 2.0     ┆ null   │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ 0.75%    ┆ null        ┆ 2.5     ┆ null   │
+    /// ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+    /// │ max      ┆ null        ┆ 3.0     ┆ null   │
+    /// └──────────┴─────────────┴─────────┴────────┘
+    /// ```
+    #[must_use]
+    #[cfg(feature = "describe")]
+    pub fn describe(&self, percentiles: Option<&[f64]>) -> Self {
+        fn describe_cast(df: &DataFrame) -> DataFrame {
+            let mut columns: Vec<Series> = vec![];
+
+            for s in df.columns.iter() {
+                columns.push(s.cast(&DataType::Float64).expect("cast to float failed"));
+            }
+
+            DataFrame::new(columns).unwrap()
+        }
+
+        fn count(df: &DataFrame) -> DataFrame {
+            let columns = df.apply_columns_par(&|s| Series::new(s.name(), [s.len() as IdxSize]));
+            DataFrame::new_no_checks(columns)
+        }
+
+        let percentiles = percentiles.unwrap_or(&[0.25, 0.5, 0.75]);
+
+        let mut headers: Vec<String> = vec![
+            "count".to_string(),
+            "mean".to_string(),
+            "std".to_string(),
+            "min".to_string(),
+        ];
+
+        let mut tmp: Vec<DataFrame> = vec![
+            describe_cast(&count(self)),
+            describe_cast(&self.mean()),
+            describe_cast(&self.std()),
+            describe_cast(&self.min()),
+        ];
+
+        for p in percentiles {
+            tmp.push(describe_cast(
+                &self
+                    .quantile(*p, QuantileInterpolOptions::Linear)
+                    .expect("quantile failed"),
+            ));
+            headers.push(format!("{}%", *p));
+        }
+
+        // Keep order same as pandas
+        tmp.push(describe_cast(&self.max()));
+        headers.push("max".to_string());
+
+        let mut summary = concat_df(&tmp).expect("unable to create dataframe");
+
+        summary
+            .insert_at_idx(0, Series::new("describe", headers))
+            .expect("insert of header failed");
+
+        summary
     }
 
     /// Aggregate the columns to their maximum values.
@@ -2763,7 +2891,7 @@ impl DataFrame {
             None => self.get_column_names(),
         };
         let gb = self.groupby(names)?;
-        let groups = gb.get_groups().idx_ref();
+        let groups = gb.get_groups().unwrap_idx();
 
         let finish_maintain_order = |mut groups: Vec<IdxSize>| {
             groups.sort_unstable();
@@ -2809,8 +2937,8 @@ impl DataFrame {
     /// # Ok::<(), PolarsError>(())
     /// ```
     pub fn is_unique(&self) -> Result<BooleanChunked> {
-        let mut gb = self.groupby(self.get_column_names())?;
-        let groups = std::mem::take(&mut gb.groups);
+        let gb = self.groupby(self.get_column_names())?;
+        let groups = gb.take_groups();
         Ok(is_unique_helper(
             groups,
             self.height() as IdxSize,
@@ -2833,8 +2961,8 @@ impl DataFrame {
     /// # Ok::<(), PolarsError>(())
     /// ```
     pub fn is_duplicated(&self) -> Result<BooleanChunked> {
-        let mut gb = self.groupby(self.get_column_names())?;
-        let groups = std::mem::take(&mut gb.groups);
+        let gb = self.groupby(self.get_column_names())?;
+        let groups = gb.take_groups();
         Ok(is_unique_helper(
             groups,
             self.height() as IdxSize,
@@ -2877,10 +3005,10 @@ impl DataFrame {
     }
 
     #[cfg(feature = "chunked_ids")]
-    pub(crate) unsafe fn take_chunked_unchecked(&self, idx: &[ChunkId]) -> Self {
+    pub(crate) unsafe fn take_chunked_unchecked(&self, idx: &[ChunkId], sorted: IsSorted) -> Self {
         let cols = self.apply_columns_par(&|s| match s.dtype() {
-            DataType::Utf8 => s._take_chunked_unchecked_threaded(idx, true),
-            _ => s._take_chunked_unchecked(idx),
+            DataType::Utf8 => s._take_chunked_unchecked_threaded(idx, sorted, true),
+            _ => s._take_chunked_unchecked(idx, sorted),
         });
 
         DataFrame::new_no_checks(cols)
@@ -2896,13 +3024,31 @@ impl DataFrame {
         DataFrame::new_no_checks(cols)
     }
 
-    pub(crate) unsafe fn take_unchecked_slice(&self, idx: &[IdxSize]) -> Self {
+    /// Be careful with allowing threads when calling this in a large hot loop
+    /// every thread split may be on rayon stack and lead to SO
+    #[doc(hidden)]
+    pub unsafe fn _take_unchecked_slice(&self, idx: &[IdxSize], allow_threads: bool) -> Self {
+        self._take_unchecked_slice2(idx, allow_threads, IsSorted::Not)
+    }
+
+    #[doc(hidden)]
+    pub unsafe fn _take_unchecked_slice2(
+        &self,
+        idx: &[IdxSize],
+        allow_threads: bool,
+        sorted: IsSorted,
+    ) -> Self {
         let ptr = idx.as_ptr() as *mut IdxSize;
         let len = idx.len();
 
         // create a temporary vec. we will not drop it.
         let mut ca = IdxCa::from_vec("", Vec::from_raw_parts(ptr, len, len));
-        let out = self.take_unchecked(&ca);
+        match sorted {
+            IsSorted::Not => {}
+            IsSorted::Ascending => ca.set_sorted(false),
+            IsSorted::Descending => ca.set_sorted(true),
+        }
+        let out = self.take_unchecked_impl(&ca, allow_threads);
 
         // ref count of buffers should be one because we dropped all allocations
         let arr = {
@@ -2919,23 +3065,33 @@ impl DataFrame {
     }
 
     #[cfg(feature = "partition_by")]
-    fn partition_by_impl(&self, cols: &[String], stable: bool) -> Result<Vec<DataFrame>> {
+    #[doc(hidden)]
+    pub fn _partition_by_impl(&self, cols: &[String], stable: bool) -> Result<Vec<DataFrame>> {
         let groups = if stable {
-            self.groupby_stable(cols)?.groups
+            self.groupby_stable(cols)?.take_groups()
         } else {
-            self.groupby(cols)?.groups
+            self.groupby(cols)?.take_groups()
         };
 
-        Ok(POOL.install(|| {
-            groups
-                .idx_ref()
-                .into_par_iter()
-                .map(|(_, group)| {
-                    // groups are in bounds
-                    unsafe { self.take_unchecked_slice(group) }
-                })
-                .collect()
-        }))
+        // don't parallelize this
+        // there is a lot of parallelization in take and this may easily SO
+        POOL.install(|| {
+            match groups {
+                GroupsProxy::Idx(idx) => {
+                    Ok(idx
+                        .into_par_iter()
+                        .map(|(_, group)| {
+                            // groups are in bounds
+                            unsafe { self._take_unchecked_slice(&group, false) }
+                        })
+                        .collect())
+                }
+                GroupsProxy::Slice { groups, .. } => Ok(groups
+                    .into_par_iter()
+                    .map(|[first, len]| self.slice(first as i64, len as usize))
+                    .collect()),
+            }
+        })
     }
 
     /// Split into multiple DataFrames partitioned by groups
@@ -2943,7 +3099,7 @@ impl DataFrame {
     #[cfg_attr(docsrs, doc(cfg(feature = "partition_by")))]
     pub fn partition_by(&self, cols: impl IntoVec<String>) -> Result<Vec<DataFrame>> {
         let cols = cols.into_vec();
-        self.partition_by_impl(&cols, false)
+        self._partition_by_impl(&cols, false)
     }
 
     /// Split into multiple DataFrames partitioned by groups
@@ -2952,7 +3108,7 @@ impl DataFrame {
     #[cfg_attr(docsrs, doc(cfg(feature = "partition_by")))]
     pub fn partition_by_stable(&self, cols: impl IntoVec<String>) -> Result<Vec<DataFrame>> {
         let cols = cols.into_vec();
-        self.partition_by_impl(&cols, true)
+        self._partition_by_impl(&cols, true)
     }
 
     /// Unnest the given `Struct` columns. This means that the fields of the `Struct` type will be
@@ -3236,6 +3392,22 @@ mod test {
         base.columns = vec![];
         let out = base.with_column(Series::new("c", [1]))?;
         assert_eq!(out.shape(), (1, 1));
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "describe")]
+    fn test_df_describe() -> Result<()> {
+        let df1: DataFrame = df!("categorical" => &["d","e","f"],
+                                 "numeric" => &[1, 2, 3],
+                                 "object" => &["a", "b", "c"])?;
+
+        assert_eq!(df1.shape(), (3, 3));
+
+        let df2: DataFrame = df1.describe(None);
+
+        assert_eq!(df2.shape(), (8, 4));
 
         Ok(())
     }

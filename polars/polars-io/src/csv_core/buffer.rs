@@ -90,7 +90,7 @@ where
                 Some(value) => self.append_value(value),
                 None => {
                     // try again without whitespace
-                    if is_whitespace(bytes[0]) {
+                    if !bytes.is_empty() && is_whitespace(bytes[0]) {
                         let bytes = skip_whitespace(bytes);
                         return self.parse_bytes(bytes, ignore_errors, needs_escaping);
                     }
@@ -183,7 +183,7 @@ impl ParsedBuffer for Utf8Field {
         let n_written = if needs_escaping {
             // Safety:
             // we just allocated enough capacity and data_len is correct.
-            unsafe { escape_field(bytes, self.quote_char, &mut self.data[data_len..]) }
+            unsafe { escape_field(bytes, self.quote_char, self.data.spare_capacity_mut()) }
         } else {
             self.data.extend_from_slice(bytes);
             bytes.len()
@@ -280,6 +280,50 @@ impl<T: PolarsNumericType> DatetimeField<T> {
 }
 
 #[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
+fn slow_datetime_parser<T>(
+    buf: &mut DatetimeField<T>,
+    bytes: &[u8],
+    ignore_errors: bool,
+) -> Result<()>
+where
+    T: PolarsNumericType,
+    DatetimeInfer<T::Native>: TryFrom<Pattern>,
+{
+    let val = if bytes.is_ascii() {
+        // Safety:
+        // we just checked it is ascii
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    } else if ignore_errors {
+        buf.builder.append_null();
+        return Ok(());
+    } else if !ignore_errors && std::str::from_utf8(bytes).is_err() {
+        return Err(PolarsError::ComputeError("invalid utf8".into()));
+    } else {
+        buf.builder.append_null();
+        return Ok(());
+    };
+
+    match infer_pattern_single(val) {
+        None => {
+            buf.builder.append_null();
+            Ok(())
+        }
+        Some(pattern) => match DatetimeInfer::<T::Native>::try_from(pattern) {
+            Ok(mut infer) => {
+                let parsed = infer.parse(val);
+                buf.compiled = Some(infer);
+                buf.builder.append_option(parsed);
+                Ok(())
+            }
+            Err(_) => {
+                buf.builder.append_null();
+                Ok(())
+            }
+        },
+    }
+}
+
+#[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
 impl<T> ParsedBuffer for DatetimeField<T>
 where
     T: PolarsNumericType,
@@ -293,43 +337,18 @@ where
         _needs_escaping: bool,
     ) -> Result<()> {
         match &mut self.compiled {
-            None => {
-                let val = if bytes.is_ascii() {
-                    // Safety:
-                    // we just checked it is ascii
-                    unsafe { std::str::from_utf8_unchecked(bytes) }
-                } else if ignore_errors {
-                    self.builder.append_null();
-                    return Ok(());
-                } else if !ignore_errors && std::str::from_utf8(bytes).is_err() {
-                    return Err(PolarsError::ComputeError("invalid utf8".into()));
-                } else {
-                    self.builder.append_null();
-                    return Ok(());
-                };
-
-                match infer_pattern_single(val) {
-                    None => {
-                        self.builder.append_null();
+            None => slow_datetime_parser(self, bytes, ignore_errors),
+            Some(compiled) => {
+                match compiled.parse_bytes(bytes) {
+                    Some(parsed) => {
+                        self.builder.append_value(parsed);
                         Ok(())
                     }
-                    Some(pattern) => match DatetimeInfer::<T::Native>::try_from(pattern) {
-                        Ok(mut infer) => {
-                            let parsed = infer.parse(val);
-                            self.compiled = Some(infer);
-                            self.builder.append_option(parsed);
-                            Ok(())
-                        }
-                        Err(_) => {
-                            self.builder.append_null();
-                            Ok(())
-                        }
-                    },
+                    // fall back on chrono parser
+                    // this is a lot slower, we need to do utf8 checking and use
+                    // the slower parser
+                    None => slow_datetime_parser(self, bytes, ignore_errors),
                 }
-            }
-            Some(compiled) => {
-                self.builder.append_option(compiled.parse_bytes(bytes));
-                Ok(())
             }
         }
     }
@@ -474,7 +493,7 @@ impl Buffer {
                     v.data.into(),
                     Some(v.validity.into()),
                 );
-                let ca = Utf8Chunked::from_chunks(&v.name, vec![Arc::new(arr)]);
+                let ca = Utf8Chunked::from_chunks(&v.name, vec![Box::new(arr)]);
                 ca.into_series()
             },
         };

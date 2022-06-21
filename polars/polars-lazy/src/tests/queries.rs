@@ -332,7 +332,6 @@ fn test_lazy_query_5() {
         .agg([col("day").head(Some(2))])
         .collect()
         .unwrap();
-    dbg!(&out);
     let s = out
         .select_at_idx(1)
         .unwrap()
@@ -1174,7 +1173,7 @@ fn test_fill_forward() -> Result<()> {
 
     let out = df
         .lazy()
-        .select([col("b").forward_fill().list().over([col("a")])])
+        .select([col("b").forward_fill(None).list().over([col("a")])])
         .collect()?;
     let agg = out.column("b")?.list()?;
 
@@ -1301,7 +1300,7 @@ fn test_regex_selection() -> Result<()> {
 
 #[test]
 fn test_filter_in_groupby_agg() -> Result<()> {
-    // This tests if the fitler is correctly handled by the binary expression.
+    // This tests if the filter is correctly handled by the binary expression.
     // This could lead to UB if it were not the case. The filter creates an empty column.
     // but the group tuples could still be untouched leading to out of bounds aggregation.
     let df = df![
@@ -1566,7 +1565,7 @@ fn test_sort_by_suffix() -> Result<()> {
 #[test]
 fn test_list_in_select_context() -> Result<()> {
     let s = Series::new("a", &[1, 2, 3]);
-    let mut builder = get_list_builder(s.dtype(), s.len(), 1, s.name());
+    let mut builder = get_list_builder(s.dtype(), s.len(), 1, s.name()).unwrap();
     builder.append_series(&s);
     let expected = builder.finish().into_series();
 
@@ -1689,7 +1688,7 @@ fn test_groupby_rank() -> Result<()> {
 fn test_apply_multiple_columns() -> Result<()> {
     let df = fruits_cars();
 
-    let multiply = |s: &mut [Series]| Ok(&s[0].pow(2.0).unwrap() * &s[1]);
+    let multiply = |s: &mut [Series]| Ok(&(&s[0] * &s[0]) * &s[1]);
 
     let out = df
         .clone()
@@ -1701,10 +1700,10 @@ fn test_apply_multiple_columns() -> Result<()> {
         )])
         .collect()?;
     let out = out.column("A")?;
-    let out = out.f64()?;
+    let out = out.i32()?;
     assert_eq!(
         Vec::from(out),
-        &[Some(5.0), Some(16.0), Some(27.0), Some(32.0), Some(25.0)]
+        &[Some(5), Some(16), Some(27), Some(32), Some(25)]
     );
 
     let out = df
@@ -1719,9 +1718,9 @@ fn test_apply_multiple_columns() -> Result<()> {
 
     let out = out.column("A")?;
     let out = out.list()?.get(1).unwrap();
-    let out = out.f64()?;
+    let out = out.i32()?;
 
-    assert_eq!(Vec::from(out), &[Some(16.0)]);
+    assert_eq!(Vec::from(out), &[Some(16)]);
     Ok(())
 }
 
@@ -1798,7 +1797,8 @@ fn test_groupby_on_lists() -> Result<()> {
     let s0 = Series::new("", [1i32, 2, 3]);
     let s1 = Series::new("groups", [4i32, 5]);
 
-    let mut builder = ListPrimitiveChunkedBuilder::<i32>::new("arrays", 10, 10, DataType::Int32);
+    let mut builder =
+        ListPrimitiveChunkedBuilder::<Int32Type>::new("arrays", 10, 10, DataType::Int32);
     builder.append_series(&s0);
     builder.append_series(&s1);
     let s2 = builder.finish().into_series();
@@ -1958,7 +1958,7 @@ fn test_is_in() -> Result<()> {
 }
 
 #[test]
-fn test_partitioned_gb() -> Result<()> {
+fn test_partitioned_gb_1() -> Result<()> {
     // don't move these to integration tests
     // keep these dtypes
     let out = df![
@@ -1991,12 +1991,103 @@ fn test_partitioned_gb_count() -> Result<()> {
     ]?
     .lazy()
     .groupby([col("col")])
-    .agg([count().alias("count")])
+    .agg([
+        // we make sure to alias with a different name
+        count().alias("counted"),
+        col("col").count().alias("count2"),
+    ])
     .collect()?;
 
     assert!(out.frame_equal(&df![
         "col" => [0],
-        "count" => [100 as IdxSize],
+        "counted" => [100 as IdxSize],
+        "count2" => [100 as IdxSize],
+    ]?));
+
+    Ok(())
+}
+
+#[test]
+fn test_partitioned_gb_mean() -> Result<()> {
+    // don't move these to integration tests
+    let out = df![
+        "key" => (0..100).map(|_| Some(0)).collect::<Int32Chunked>().into_series(),
+    ]?
+    .lazy()
+    .with_columns([lit("a").alias("str"), lit(1).alias("int")])
+    .groupby([col("key")])
+    .agg([
+        col("str").mean().alias("mean_str"),
+        col("int").mean().alias("mean_int"),
+    ])
+    .collect()?;
+
+    assert_eq!(out.shape(), (1, 3));
+    let str_col = out.column("mean_str")?;
+    assert_eq!(str_col.get(0), AnyValue::Null);
+    let int_col = out.column("mean_int")?;
+    assert_eq!(int_col.get(0), AnyValue::Float64(1.0));
+
+    Ok(())
+}
+
+#[test]
+fn test_partitioned_gb_binary() -> Result<()> {
+    // don't move these to integration tests
+    let df = df![
+        "col" => (0..20).map(|_| Some(0)).collect::<Int32Chunked>().into_series(),
+    ]?;
+
+    let out = df
+        .clone()
+        .lazy()
+        .groupby([col("col")])
+        .agg([(col("col") + lit(10)).sum().alias("sum")])
+        .collect()?;
+
+    assert!(out.frame_equal(&df![
+        "col" => [0],
+        "sum" => [200],
+    ]?));
+
+    let out = df
+        .lazy()
+        .groupby([col("col")])
+        .agg([(col("col").cast(DataType::Float32) + lit(10.0))
+            .sum()
+            .alias("sum")])
+        .collect()?;
+
+    assert!(out.frame_equal(&df![
+        "col" => [0],
+        "sum" => [200.0 as f32],
+    ]?));
+
+    Ok(())
+}
+
+#[test]
+fn test_partitioned_gb_ternary() -> Result<()> {
+    // don't move these to integration tests
+    let df = df![
+        "col" => (0..20).map(|_| Some(0)).collect::<Int32Chunked>().into_series(),
+        "val" => (0..20).map(|i| Some(i)).collect::<Int32Chunked>().into_series(),
+    ]?;
+
+    let out = df
+        .clone()
+        .lazy()
+        .groupby([col("col")])
+        .agg([when(col("val").gt(lit(10)))
+            .then(lit(1))
+            .otherwise(lit(0))
+            .sum()
+            .alias("sum")])
+        .collect()?;
+
+    assert!(out.frame_equal(&df![
+        "col" => [0],
+        "sum" => [9],
     ]?));
 
     Ok(())

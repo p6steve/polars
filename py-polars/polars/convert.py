@@ -65,15 +65,7 @@ def from_dict(
     └─────┴─────┘
 
     """
-    # To deal with structs, we have to modify the data, but we dont want to modify
-    # `data` directly. Thus we create a separate dict, and only do so for the
-    # for the fields that need this, to save memory
-    data_struct = dict()
-    for col_name, value in data.items():
-        if isinstance(value, dict):
-            data_struct[col_name] = from_dict(value).to_struct(col_name)
-
-    return DataFrame._from_dict(data=dict(data, **data_struct), columns=columns)  # type: ignore
+    return DataFrame._from_dict(data=data, columns=columns)  # type: ignore
 
 
 def from_records(
@@ -125,7 +117,10 @@ def from_records(
     return DataFrame._from_records(data, columns=columns, orient=orient)
 
 
-def from_dicts(dicts: Sequence[Dict[str, Any]]) -> DataFrame:
+def from_dicts(
+    dicts: Sequence[Dict[str, Any]],
+    infer_schema_length: Optional[int] = 50,
+) -> DataFrame:
     """
     Construct a DataFrame from a sequence of dictionaries.
 
@@ -133,6 +128,9 @@ def from_dicts(dicts: Sequence[Dict[str, Any]]) -> DataFrame:
     ----------
     dicts
         Sequence with dictionaries mapping column name to value
+    infer_schema_length
+        How many dictionaries/rows to scan to determine the data types
+        if set to `None` all rows are scanned. This will be slow.
 
     Returns
     -------
@@ -158,7 +156,7 @@ def from_dicts(dicts: Sequence[Dict[str, Any]]) -> DataFrame:
     └─────┴─────┘
 
     """
-    return DataFrame._from_dicts(dicts)
+    return DataFrame._from_dicts(dicts, infer_schema_length)
 
 
 # Note that we cannot overload because pyarrow has no stubs :(
@@ -256,7 +254,7 @@ def from_pandas(
     """
     Construct a Polars DataFrame or Series from a pandas DataFrame or Series.
 
-    Requires the pandas package to be installed.
+    This requires that pandas and pyarrow are installed.
 
     Parameters
     ----------
@@ -305,6 +303,11 @@ def from_pandas(
     ]
 
     """
+    if not _PYARROW_AVAILABLE:
+        raise ImportError(  # pragma: no cover
+            "'pyarrow' is required when using from_pandas()."
+        )
+
     try:
         import pandas as pd
     except ImportError as e:  # pragma: no cover

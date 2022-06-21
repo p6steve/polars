@@ -29,8 +29,6 @@ pub mod object;
 #[cfg(feature = "random")]
 #[cfg_attr(docsrs, doc(cfg(feature = "random")))]
 mod random;
-#[cfg(feature = "strings")]
-#[cfg_attr(docsrs, doc(cfg(feature = "strings")))]
 pub mod strings;
 #[cfg(any(
     feature = "temporal",
@@ -46,6 +44,7 @@ use polars_arrow::prelude::*;
 
 #[cfg(feature = "dtype-categorical")]
 use crate::chunked_array::categorical::RevMapping;
+use crate::series::IsSorted;
 use crate::utils::CustomIterTools;
 use std::mem;
 
@@ -165,11 +164,28 @@ impl<T> ChunkedArray<T> {
     }
 
     /// Set the 'sorted' bit meta info.
-    pub(crate) fn set_sorted(&mut self, reverse: bool) {
+    pub fn set_sorted(&mut self, reverse: bool) {
         if reverse {
+            // unset sorted
+            self.bit_settings &= !1;
+            // set reverse sorted
             self.bit_settings |= 1 << 1
         } else {
+            // // unset reverse sorted
+            self.bit_settings &= !(1 << 1);
+            // set sorted
             self.bit_settings |= 1
+        }
+    }
+
+    pub fn set_sorted2(&mut self, sorted: IsSorted) {
+        match sorted {
+            IsSorted::Not => {
+                self.bit_settings &= !(1 << 1);
+                self.bit_settings &= !1;
+            }
+            IsSorted::Ascending => self.set_sorted(false),
+            IsSorted::Descending => self.set_sorted(true),
         }
     }
 
@@ -213,8 +229,7 @@ impl<T> ChunkedArray<T> {
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
-        .unwrap()
-        .into()];
+        .unwrap()];
     }
 
     /// Unpack a Series to the same physical type.
@@ -334,7 +349,7 @@ impl<T> ChunkedArray<T> {
                     .validity()
                     .map(|bitmap| !bitmap)
                     .unwrap_or_else(|| Bitmap::new_zeroed(arr.len()));
-                Arc::new(BooleanArray::from_data_default(bitmap, None)) as ArrayRef
+                Box::new(BooleanArray::from_data_default(bitmap, None)) as ArrayRef
             })
             .collect::<Vec<_>>();
         BooleanChunked::from_chunks(self.name(), chunks)
@@ -353,7 +368,7 @@ impl<T> ChunkedArray<T> {
                     .validity()
                     .cloned()
                     .unwrap_or_else(|| !(&Bitmap::new_zeroed(arr.len())));
-                Arc::new(BooleanArray::from_data_default(bitmap, None)) as ArrayRef
+                Box::new(BooleanArray::from_data_default(bitmap, None)) as ArrayRef
             })
             .collect::<Vec<_>>();
         BooleanChunked::from_chunks(self.name(), chunks)
@@ -400,7 +415,9 @@ where
             let mut offset = 0;
             let chunks = chunk_id
                 .map(|len| {
-                    let out = array.slice(offset, len).into();
+                    // safety:
+                    // within bounds
+                    let out = unsafe { array.slice_unchecked(offset, len) };
                     offset += len;
                     out
                 })
@@ -435,6 +452,22 @@ where
             T::get_dtype()
         };
         let field = Arc::new(Field::new(name, datatype));
+        ChunkedArray {
+            field,
+            chunks,
+            phantom: PhantomData,
+            categorical_map: None,
+            bit_settings: 0,
+        }
+    }
+}
+
+// A hack to save compiler bloat for null arrays
+impl Int32Chunked {
+    pub(crate) fn new_null(name: &str, len: usize) -> Self {
+        let arr = arrow::array::new_null_array(ArrowDataType::Null, len);
+        let field = Arc::new(Field::new(name, DataType::Null));
+        let chunks = vec![arr as ArrayRef];
         ChunkedArray {
             field,
             chunks,
@@ -603,12 +636,12 @@ pub(crate) fn to_array<T: PolarsNumericType>(
     values: Vec<T::Native>,
     validity: Option<Bitmap>,
 ) -> ArrayRef {
-    Arc::new(to_primitive::<T>(values, validity))
+    Box::new(to_primitive::<T>(values, validity))
 }
 
 impl<T: PolarsNumericType> From<PrimitiveArray<T::Native>> for ChunkedArray<T> {
     fn from(a: PrimitiveArray<T::Native>) -> Self {
-        ChunkedArray::from_chunks("", vec![Arc::new(a)])
+        ChunkedArray::from_chunks("", vec![Box::new(a)])
     }
 }
 

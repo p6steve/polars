@@ -1,8 +1,6 @@
 //! Traits for miscellaneous operations on ChunkedArray
 use std::marker::Sized;
 
-use arrow::array::ArrayRef;
-
 pub use self::take::*;
 #[cfg(feature = "object")]
 use crate::chunked_array::object::ObjectType;
@@ -124,7 +122,7 @@ pub trait ChunkTakeEvery<T> {
     fn take_every(&self, n: usize) -> ChunkedArray<T>;
 }
 
-/// Explode/ flatten a
+/// Explode/ flatten a List or Utf8 Series
 pub trait ChunkExplode {
     fn explode(&self) -> Result<Series> {
         self.explode_and_offsets().map(|t| t.0)
@@ -144,7 +142,7 @@ pub trait ChunkRollApply {
     fn rolling_apply(
         &self,
         _f: &dyn Fn(&Series) -> Series,
-        _options: RollingOptions,
+        _options: RollingOptionsFixedWindow,
     ) -> Result<Series>
     where
         Self: Sized,
@@ -300,6 +298,9 @@ pub trait ChunkSet<'a, A, B> {
 pub trait ChunkCast {
     /// Cast a `[ChunkedArray]` to `[DataType]`
     fn cast(&self, data_type: &DataType) -> Result<Series>;
+
+    /// Does not check if the cast is a valid one and may over/underflow
+    fn cast_unchecked(&self, data_type: &DataType) -> Result<Series>;
 }
 
 /// Fastest way to do elementwise operations on a ChunkedArray<T> when the operation is cheaper than
@@ -525,12 +526,14 @@ pub trait ChunkSort<T> {
     }
 }
 
+pub type FillNullLimit = Option<IdxSize>;
+
 #[derive(Copy, Clone, Debug)]
 pub enum FillNullStrategy {
     /// previous value in array
-    Backward,
+    Backward(FillNullLimit),
     /// next value in array
-    Forward,
+    Forward(FillNullLimit),
     /// mean value of array
     Mean,
     /// minimal value in array

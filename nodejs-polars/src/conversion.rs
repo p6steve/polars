@@ -340,9 +340,9 @@ impl FromNapiValue for Wrap<ParquetCompression> {
         let compression = String::from_napi_value(env, napi_val)?;
         let compression = match compression.as_ref() {
             "snappy" => ParquetCompression::Snappy,
-            "gzip" => ParquetCompression::Gzip,
+            "gzip" => ParquetCompression::Gzip(None),
             "lzo" => ParquetCompression::Lzo,
-            "brotli" => ParquetCompression::Brotli,
+            "brotli" => ParquetCompression::Brotli(None),
             "lz4" => ParquetCompression::Lz4Raw,
             "zstd" => ParquetCompression::Zstd(None),
             _ => ParquetCompression::Uncompressed,
@@ -415,8 +415,8 @@ impl FromNapiValue for Wrap<FillNullStrategy> {
     unsafe fn from_napi_value(env: sys::napi_env, napi_val: sys::napi_value) -> JsResult<Self> {
         let method = String::from_napi_value(env, napi_val)?;
         let method = match method.as_ref() {
-            "backward" => FillNullStrategy::Backward,
-            "forward" => FillNullStrategy::Forward,
+            "backward" => FillNullStrategy::Backward(None),
+            "forward" => FillNullStrategy::Forward(None),
             "min" => FillNullStrategy::Min,
             "max" => FillNullStrategy::Max,
             "mean" => FillNullStrategy::Mean,
@@ -480,19 +480,35 @@ impl<'a> FromNapiValue for Wrap<&'a str> {
 
 #[napi(object)]
 pub struct JsRollingOptions {
-    pub window_size: i64,
+    pub window_size: String,
     pub weights: Option<Vec<f64>>,
     pub min_periods: i64,
     pub center: bool,
 }
 
-impl From<JsRollingOptions> for RollingOptions {
+impl From<JsRollingOptions> for RollingOptionsImpl<'static> {
     fn from(o: JsRollingOptions) -> Self {
-        RollingOptions {
-            window_size: o.window_size as usize,
+        RollingOptionsImpl {
+            window_size: Duration::parse(&o.window_size),
             weights: o.weights,
             min_periods: o.min_periods as usize,
             center: o.center,
+            by: None,
+            tu: None,
+            closed_window: None,
+        }
+    }
+}
+
+impl From<JsRollingOptions> for RollingOptions {
+    fn from(o: JsRollingOptions) -> Self {
+        RollingOptions {
+            window_size: Duration::parse(&o.window_size),
+            weights: o.weights,
+            min_periods: o.min_periods as usize,
+            center: o.center,
+            by: None,
+            closed_window: None,
         }
     }
 }

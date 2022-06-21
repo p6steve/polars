@@ -119,3 +119,57 @@ def test_cat_to_dummies() -> None:
         "bar_b": [0, 1, 0, 0],
         "bar_c": [0, 0, 0, 1],
     }
+
+
+def test_comp_categorical_lit_dtype() -> None:
+    df = pl.DataFrame(
+        data={"column": ["a", "b", "e"], "values": [1, 5, 9]},
+        columns=[("column", pl.Categorical), ("more", pl.Int32)],
+    )
+
+    assert df.with_column(
+        pl.when(pl.col("column") == "e")
+        .then("d")
+        .otherwise(pl.col("column"))
+        .alias("column")
+    ).dtypes == [pl.Categorical, pl.Int32]
+
+
+def test_categorical_describe_3487() -> None:
+    # test if we don't err
+    df = pl.DataFrame({"cats": ["a", "b"]})
+    df = df.with_column(pl.col("cats").cast(pl.Categorical))
+    df.describe()
+
+
+def test_categorical_is_in_list() -> None:
+    # this requires type coercion to cast.
+    # we should not cast within the function as this would be expensive within a groupby context
+    # that would be a cast per group
+    with pl.StringCache():
+        df = pl.DataFrame(
+            {"a": [1, 2, 3, 1, 2], "b": ["a", "b", "c", "d", "e"]}
+        ).with_column(pl.col("b").cast(pl.Categorical))
+
+        cat_list = ["a", "b", "c"]
+        assert df.filter(pl.col("b").is_in(cat_list)).to_dict(False) == {
+            "a": [1, 2, 3],
+            "b": ["a", "b", "c"],
+        }
+
+
+def test_unset_sorted_on_append() -> None:
+    df1 = pl.DataFrame(
+        [
+            pl.Series("key", ["a", "b", "a", "b"], dtype=pl.Categorical),
+            pl.Series("val", [1, 2, 3, 4]),
+        ]
+    ).sort("key")
+    df2 = pl.DataFrame(
+        [
+            pl.Series("key", ["a", "b", "a", "b"], dtype=pl.Categorical),
+            pl.Series("val", [5, 6, 7, 8]),
+        ]
+    ).sort("key")
+    df = pl.concat([df1, df2], rechunk=False)
+    assert df.groupby("key").count()["count"].to_list() == [4, 4]

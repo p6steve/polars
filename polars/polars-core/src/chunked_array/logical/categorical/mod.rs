@@ -2,6 +2,7 @@ mod builder;
 mod from;
 mod merge;
 mod ops;
+pub mod stringcache;
 
 use super::*;
 use crate::prelude::*;
@@ -217,7 +218,7 @@ mod test {
         let ca = ca.categorical().unwrap();
 
         let arr: DictionaryArray<u32> = (ca).into();
-        let s = Series::try_from(("foo", Arc::new(arr) as ArrayRef))?;
+        let s = Series::try_from(("foo", Box::new(arr) as ArrayRef))?;
         assert!(matches!(s.dtype(), &DataType::Categorical(_)));
         assert_eq!(s.null_count(), 1);
         assert_eq!(s.len(), 6);
@@ -278,7 +279,7 @@ mod test {
         ));
 
         let groups = s.group_tuples(false, true);
-        let aggregated = s.agg_list(&groups);
+        let aggregated = unsafe { s.agg_list(&groups) };
         match aggregated.get(0) {
             AnyValue::List(s) => {
                 assert!(matches!(s.dtype(), DataType::Categorical(_)));

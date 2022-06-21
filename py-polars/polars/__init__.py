@@ -24,6 +24,7 @@ from polars.datatypes import (
     Date,
     Datetime,
     Duration,
+    Field,
     Float32,
     Float64,
     Int8,
@@ -33,6 +34,7 @@ from polars.datatypes import (
     List,
     Null,
     Object,
+    PolarsDataType,
     Struct,
     Time,
     UInt8,
@@ -44,8 +46,10 @@ from polars.datatypes import (
 from polars.exceptions import (
     ArrowError,
     ComputeError,
+    DuplicateError,
     NoDataError,
     NotFoundError,
+    PanicException,
     SchemaError,
     ShapeError,
 )
@@ -55,6 +59,7 @@ from polars.internals.frame import (  # flake8: noqa # TODO: remove need for wra
     wrap_df,
 )
 from polars.internals.functions import arg_where, concat, date_range, get_dummies
+from polars.internals.io import read_ipc_schema, read_parquet_schema
 from polars.internals.lazy_frame import LazyFrame
 from polars.internals.lazy_functions import _date as date
 from polars.internals.lazy_functions import _datetime as datetime
@@ -72,6 +77,7 @@ from polars.internals.lazy_functions import (
     count,
     cov,
     duration,
+    element,
     exclude,
     first,
     fold,
@@ -107,16 +113,18 @@ from polars.internals.whenthen import when
 from polars.io import (
     read_avro,
     read_csv,
+    read_excel,
     read_ipc,
-    read_ipc_schema,
     read_json,
     read_parquet,
     read_sql,
     scan_csv,
+    scan_ds,
     scan_ipc,
     scan_parquet,
 )
 from polars.string_cache import StringCache
+from polars.utils import threadpool_size
 
 __all__ = [
     "exceptions",
@@ -149,6 +157,7 @@ __all__ = [
     "Time",
     "Object",
     "Categorical",
+    "Field",
     "Struct",
     # polars.io
     "read_csv",
@@ -158,8 +167,10 @@ __all__ = [
     "read_ipc",
     "scan_csv",
     "scan_ipc",
+    "scan_ds",
     "scan_parquet",
     "read_ipc_schema",
+    "read_parquet_schema",
     "read_avro",
     # polars.stringcache
     "StringCache",
@@ -223,6 +234,7 @@ __all__ = [
     "from_pandas",
     # testing
     "testing",
+    "threadpool_size",
 ]
 
 __version__ = version()

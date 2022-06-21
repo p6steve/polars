@@ -3,6 +3,11 @@ LazyFrame
 =========
 .. currentmodule:: polars
 
+.. py:class:: LazyFrame
+    :canonical: polars.internals.lazy_frame.LazyFrame
+
+    Representation of a Lazy computation graph/ query.
+
 Attributes
 ----------
 
@@ -49,7 +54,7 @@ Manipulation/ selection
     LazyFrame.groupby_dynamic
     LazyFrame.groupby_rolling
     LazyFrame.join
-    DataFrame.join_asof
+    LazyFrame.join_asof
     LazyFrame.with_columns
     LazyFrame.with_column
     LazyFrame.drop

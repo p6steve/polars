@@ -57,7 +57,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
             .into_series()
     }
 
-    fn set_sorted(&mut self, reverse: bool) {
+    fn _set_sorted(&mut self, reverse: bool) {
         self.0.deref_mut().set_sorted(reverse)
     }
 
@@ -81,21 +81,48 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
         self.0.vec_hash_combine(build_hasher, hashes)
     }
 
-    fn agg_min(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
         self.0
             .agg_min(groups)
             .into_duration(self.0.time_unit())
             .into_series()
     }
 
-    fn agg_max(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
         self.0
             .agg_max(groups)
             .into_duration(self.0.time_unit())
             .into_series()
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_sum(&self, groups: &GroupsProxy) -> Series {
+        self.0
+            .agg_sum(groups)
+            .into_duration(self.0.time_unit())
+            .into_series()
+    }
+
+    unsafe fn agg_std(&self, groups: &GroupsProxy) -> Series {
+        self.0
+            .agg_std(groups)
+            // cast f64 back to physical type
+            .cast(&DataType::Int64)
+            .unwrap()
+            .into_duration(self.0.time_unit())
+            .into_series()
+    }
+
+    unsafe fn agg_var(&self, groups: &GroupsProxy) -> Series {
+        self.0
+            .agg_var(groups)
+            // cast f64 back to physical type
+            .cast(&DataType::Int64)
+            .unwrap()
+            .into_duration(self.0.time_unit())
+            .into_series()
+    }
+
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         // we cannot cast and dispatch as the inner type of the list would be incorrect
         self.0
             .agg_list(groups)
@@ -103,7 +130,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
             .unwrap()
     }
 
-    fn agg_quantile(
+    unsafe fn agg_quantile(
         &self,
         groups: &GroupsProxy,
         quantile: f64,
@@ -111,13 +138,19 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
     ) -> Series {
         self.0
             .agg_quantile(groups, quantile, interpol)
+            // cast f64 back to physical type
+            .cast(&DataType::Int64)
+            .unwrap()
             .into_duration(self.0.time_unit())
             .into_series()
     }
 
-    fn agg_median(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_median(&self, groups: &GroupsProxy) -> Series {
         self.0
             .agg_median(groups)
+            // cast f64 back to physical type
+            .cast(&DataType::Int64)
+            .unwrap()
             .into_duration(self.0.time_unit())
             .into_series()
     }
@@ -238,10 +271,6 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
         self.0.shrink_to_fit()
     }
 
-    fn duration(&self) -> Result<&DurationChunked> {
-        unsafe { Ok(&*(self as *const dyn SeriesTrait as *const DurationChunked)) }
-    }
-
     fn append_array(&mut self, other: ArrayRef) -> Result<()> {
         self.0.append_array(other)
     }
@@ -292,8 +321,8 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-        let ca = self.0.deref().take_chunked_unchecked(by);
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+        let ca = self.0.deref().take_chunked_unchecked(by, sorted);
         ca.into_duration(self.0.time_unit()).into_series()
     }
 
@@ -327,9 +356,13 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
     }
 
     unsafe fn take_unchecked(&self, idx: &IdxCa) -> Result<Series> {
-        Ok(ChunkTake::take_unchecked(self.0.deref(), idx.into())
-            .into_duration(self.0.time_unit())
-            .into_series())
+        let mut out = ChunkTake::take_unchecked(self.0.deref(), idx.into());
+
+        if self.0.is_sorted() && (idx.is_sorted() || idx.is_sorted_reverse()) {
+            out.set_sorted(idx.is_sorted_reverse())
+        }
+
+        Ok(out.into_duration(self.0.time_unit()).into_series())
     }
 
     unsafe fn take_opt_iter_unchecked(&self, iter: &mut dyn TakeIteratorNulls) -> Series {

@@ -5,7 +5,9 @@ pub mod cat;
 pub use cat::*;
 #[cfg(feature = "temporal")]
 mod dt;
+mod eval;
 mod expr;
+mod from;
 pub(crate) mod function_expr;
 #[cfg(feature = "compile")]
 mod functions;
@@ -16,6 +18,7 @@ mod options;
 pub mod string;
 #[cfg(feature = "dtype-struct")]
 mod struct_;
+use polars_time::series::SeriesOpsTime;
 
 use crate::prelude::*;
 use crate::utils::has_expr;
@@ -27,7 +30,6 @@ use polars_core::export::arrow::{array::BooleanArray, bitmap::MutableBitmap};
 use polars_core::prelude::*;
 
 use std::fmt::Debug;
-use std::ops::Not;
 use std::{
     ops::{Add, Div, Mul, Rem, Sub},
     sync::Arc,
@@ -43,7 +45,9 @@ use crate::dsl::function_expr::FunctionExpr;
 use polars_arrow::array::default_arrays::FromData;
 #[cfg(feature = "diff")]
 use polars_core::series::ops::NullBehavior;
+use polars_core::series::IsSorted;
 use polars_core::utils::{get_supertype, NoNull};
+use polars_ops::prelude::SeriesOps;
 
 pub fn binary_expr(l: Expr, op: Operator, r: Expr) -> Expr {
     Expr::BinaryExpr {
@@ -82,27 +86,27 @@ pub struct WhenThenThen {
 }
 
 impl When {
-    pub fn then(self, expr: Expr) -> WhenThen {
+    pub fn then<E: Into<Expr>>(self, expr: E) -> WhenThen {
         WhenThen {
             predicate: self.predicate,
-            then: expr,
+            then: expr.into(),
         }
     }
 }
 
 impl WhenThen {
-    pub fn when(self, predicate: Expr) -> WhenThenThen {
+    pub fn when<E: Into<Expr>>(self, predicate: E) -> WhenThenThen {
         WhenThenThen {
-            predicates: vec![self.predicate, predicate],
+            predicates: vec![self.predicate, predicate.into()],
             thens: vec![self.then],
         }
     }
 
-    pub fn otherwise(self, expr: Expr) -> Expr {
+    pub fn otherwise<E: Into<Expr>>(self, expr: E) -> Expr {
         Expr::Ternary {
             predicate: Box::new(self.predicate),
             truthy: Box::new(self.then),
-            falsy: Box::new(expr),
+            falsy: Box::new(expr.into()),
         }
     }
 }
@@ -139,7 +143,7 @@ impl WhenThenThen {
         //         )                                            _|      _|
         //
         // by iterating lifo we first create
-        // `inner` and then assighn that to `otherwise`,
+        // `inner` and then assign that to `otherwise`,
         // which will be used in the next layer `outer`
         //
 
@@ -170,8 +174,10 @@ impl WhenThenThen {
 }
 
 /// Start a when-then-otherwise expression
-pub fn when(predicate: Expr) -> When {
-    When { predicate }
+pub fn when<E: Into<Expr>>(predicate: E) -> When {
+    When {
+        predicate: predicate.into(),
+    }
 }
 
 pub fn ternary_expr(predicate: Expr, truthy: Expr, falsy: Expr) -> Expr {
@@ -233,33 +239,33 @@ impl Expr {
     }
 
     /// Compare `Expr` with other `Expr` on equality
-    pub fn eq(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::Eq, other)
+    pub fn eq<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::Eq, other.into())
     }
 
     /// Compare `Expr` with other `Expr` on non-equality
-    pub fn neq(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::NotEq, other)
+    pub fn neq<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::NotEq, other.into())
     }
 
     /// Check if `Expr` < `Expr`
-    pub fn lt(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::Lt, other)
+    pub fn lt<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::Lt, other.into())
     }
 
     /// Check if `Expr` > `Expr`
-    pub fn gt(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::Gt, other)
+    pub fn gt<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::Gt, other.into())
     }
 
     /// Check if `Expr` >= `Expr`
-    pub fn gt_eq(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::GtEq, other)
+    pub fn gt_eq<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::GtEq, other.into())
     }
 
     /// Check if `Expr` <= `Expr`
-    pub fn lt_eq(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::LtEq, other)
+    pub fn lt_eq<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::LtEq, other.into())
     }
 
     /// Negate `Expr`
@@ -296,12 +302,12 @@ impl Expr {
             |s| match s.dtype() {
                 DataType::Float32 => {
                     let ca = s.f32()?;
-                    let mask = ca.is_nan().not();
+                    let mask = ca.is_not_nan().fill_null(FillNullStrategy::One)?;
                     ca.filter(&mask).map(|ca| ca.into_series())
                 }
                 DataType::Float64 => {
                     let ca = s.f64()?;
-                    let mask = ca.is_nan().not();
+                    let mask = ca.is_not_nan().fill_null(FillNullStrategy::One)?;
                     ca.filter(&mask).map(|ca| ca.into_series())
                 }
                 _ => Ok(s),
@@ -409,12 +415,36 @@ impl Expr {
 
     /// Slice the Series.
     /// `offset` may be negative.
-    pub fn slice(self, offset: Expr, length: Expr) -> Self {
+    pub fn slice<E: Into<Expr>, F: Into<Expr>>(self, offset: E, length: F) -> Self {
         Expr::Slice {
             input: Box::new(self),
-            offset: Box::new(offset),
-            length: Box::new(length),
+            offset: Box::new(offset.into()),
+            length: Box::new(length.into()),
         }
+    }
+
+    /// Append expressions. This is done by adding the chunks of `other` to this [`Series`].
+    pub fn append<E: Into<Expr>>(self, other: E, upcast: bool) -> Self {
+        let output_type = if upcast {
+            GetOutput::super_type()
+        } else {
+            GetOutput::same_type()
+        };
+
+        apply_binary(
+            self,
+            other.into(),
+            move |mut a, mut b| {
+                if upcast {
+                    let dtype = get_supertype(a.dtype(), b.dtype())?;
+                    a = a.cast(&dtype)?;
+                    b = b.cast(&dtype)?;
+                }
+                a.append(&b)?;
+                Ok(a)
+            },
+            output_type,
+        )
     }
 
     /// Get the first `n` elements of the Expr result
@@ -450,7 +480,7 @@ impl Expr {
         .with_fmt("arg_unique")
     }
 
-    /// Get the index value that has the minumum value
+    /// Get the index value that has the minimum value
     pub fn arg_min(self) -> Self {
         let options = FunctionOptions {
             collect_groups: ApplyOptions::ApplyGroups,
@@ -528,10 +558,10 @@ impl Expr {
     }
 
     /// Take the values by idx.
-    pub fn take(self, idx: Expr) -> Self {
+    pub fn take<E: Into<Expr>>(self, idx: E) -> Self {
         Expr::Take {
             expr: Box::new(self),
-            idx: Box::new(idx),
+            idx: Box::new(idx.into()),
         }
     }
 
@@ -587,6 +617,19 @@ impl Expr {
         }
     }
 
+    fn map_private(self, function_expr: FunctionExpr, fmt_str: &'static str) -> Self {
+        Expr::Function {
+            input: vec![self],
+            function: function_expr,
+            options: FunctionOptions {
+                collect_groups: ApplyOptions::ApplyFlat,
+                input_wildcard_expansion: false,
+                auto_explode: false,
+                fmt_str,
+            },
+        }
+    }
+
     /// Apply a function/closure once the logical plan get executed with many arguments
     ///
     /// See the [`Expr::map`] function for the differences between [`map`](Expr::map) and [`apply`](Expr::apply).
@@ -631,7 +674,7 @@ impl Expr {
                 collect_groups: ApplyOptions::ApplyList,
                 input_wildcard_expansion: false,
                 auto_explode: false,
-                fmt_str: "",
+                fmt_str: "map_list",
             },
         }
     }
@@ -720,6 +763,50 @@ impl Expr {
         }
     }
 
+    pub fn apply_many_private(
+        self,
+        function_expr: FunctionExpr,
+        arguments: &[Expr],
+        fmt_str: &'static str,
+    ) -> Self {
+        let mut input = Vec::with_capacity(arguments.len() + 1);
+        input.push(self);
+        input.extend_from_slice(arguments);
+
+        Expr::Function {
+            input,
+            function: function_expr,
+            options: FunctionOptions {
+                collect_groups: ApplyOptions::ApplyGroups,
+                input_wildcard_expansion: false,
+                auto_explode: true,
+                fmt_str,
+            },
+        }
+    }
+
+    pub fn map_many_private(
+        self,
+        function_expr: FunctionExpr,
+        arguments: &[Expr],
+        fmt_str: &'static str,
+    ) -> Self {
+        let mut input = Vec::with_capacity(arguments.len() + 1);
+        input.push(self);
+        input.extend_from_slice(arguments);
+
+        Expr::Function {
+            input,
+            function: function_expr,
+            options: FunctionOptions {
+                collect_groups: ApplyOptions::ApplyFlat,
+                input_wildcard_expansion: false,
+                auto_explode: true,
+                fmt_str,
+            },
+        }
+    }
+
     /// Get mask of finite values if dtype is Float
     #[allow(clippy::wrong_self_convention)]
     pub fn is_finite(self) -> Self {
@@ -768,8 +855,7 @@ impl Expr {
         }
     }
 
-    /// Shift the values in the array by some period and fill the resulting empty values.
-    pub fn shift_and_fill(self, periods: i64, fill_value: Expr) -> Self {
+    pub fn shift_and_fill_impl(self, periods: i64, fill_value: Expr) -> Self {
         // Note:
         // The order of the then | otherwise is important
         if periods > 0 {
@@ -805,6 +891,11 @@ impl Expr {
             .then(self.shift(periods))
             .otherwise(fill_value)
         }
+    }
+
+    /// Shift the values in the array by some period and fill the resulting empty values.
+    pub fn shift_and_fill<E: Into<Expr>>(self, periods: i64, fill_value: E) -> Self {
+        self.shift_and_fill_impl(periods, fill_value.into())
     }
 
     /// Get an array with the cumulative sum computed at every element
@@ -861,10 +952,17 @@ impl Expr {
         .with_fmt("cummax")
     }
 
-    /// Get the product aggreagtion of an expresion
+    /// Get the product aggregation of an expression
     #[cfg_attr(docsrs, doc(cfg(feature = "product")))]
     pub fn product(self) -> Self {
-        self.apply(
+        let options = FunctionOptions {
+            collect_groups: ApplyOptions::ApplyGroups,
+            input_wildcard_expansion: false,
+            auto_explode: true,
+            fmt_str: "product",
+        };
+
+        self.function_with_options(
             move |s: Series| Ok(s.product()),
             GetOutput::map_dtype(|dt| {
                 use DataType::*;
@@ -874,23 +972,23 @@ impl Expr {
                     _ => Int64,
                 }
             }),
+            options,
         )
-        .with_fmt("product")
     }
 
     /// Fill missing value with next non-null.
-    pub fn backward_fill(self) -> Self {
+    pub fn backward_fill(self, limit: FillNullLimit) -> Self {
         self.apply(
-            move |s: Series| s.fill_null(FillNullStrategy::Backward),
+            move |s: Series| s.fill_null(FillNullStrategy::Backward(limit)),
             GetOutput::same_type(),
         )
         .with_fmt("backward_fill")
     }
 
     /// Fill missing value with previous non-null.
-    pub fn forward_fill(self) -> Self {
+    pub fn forward_fill(self, limit: FillNullLimit) -> Self {
         self.apply(
-            move |s: Series| s.fill_null(FillNullStrategy::Forward),
+            move |s: Series| s.fill_null(FillNullStrategy::Forward(limit)),
             GetOutput::same_type(),
         )
         .with_fmt("forward_fill")
@@ -912,7 +1010,7 @@ impl Expr {
             .with_fmt("floor")
     }
 
-    /// Ceil underlying floating point array to the heighest integers smaller or equal to the float value.
+    /// Ceil underlying floating point array to the highest integers smaller or equal to the float value.
     #[cfg(feature = "round_series")]
     #[cfg_attr(docsrs, doc(cfg(feature = "round_series")))]
     pub fn ceil(self) -> Self {
@@ -995,17 +1093,21 @@ impl Expr {
     /// │ 1      ┆ 16     │
     /// ╰────────┴────────╯
     /// ```
-    pub fn over<E: AsRef<[Expr]>>(self, partition_by: E) -> Self {
+    pub fn over<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(self, partition_by: E) -> Self {
+        let partition_by = partition_by
+            .as_ref()
+            .iter()
+            .map(|e| e.clone().into())
+            .collect();
         Expr::Window {
             function: Box::new(self),
-            partition_by: partition_by.as_ref().to_vec(),
+            partition_by,
             order_by: None,
             options: WindowOptions { explode: false },
         }
     }
 
-    /// Replace the null values by a value.
-    pub fn fill_null(self, fill_value: Expr) -> Self {
+    fn fill_null_impl(self, fill_value: Expr) -> Self {
         self.map_many(
             |s| {
                 let a = &s[0];
@@ -1027,9 +1129,16 @@ impl Expr {
         .with_fmt("fill_null")
     }
 
+    /// Replace the null values by a value.
+    pub fn fill_null<E: Into<Expr>>(self, fill_value: E) -> Self {
+        self.fill_null_impl(fill_value.into())
+    }
+
     /// Replace the floating point `NaN` values by a value.
-    pub fn fill_nan(self, fill_value: Expr) -> Self {
-        when(self.clone().is_nan()).then(fill_value).otherwise(self)
+    pub fn fill_nan<E: Into<Expr>>(self, fill_value: E) -> Self {
+        when(self.clone().is_nan())
+            .then(fill_value.into())
+            .otherwise(self)
     }
     /// Count the values of the Series
     /// or
@@ -1061,39 +1170,44 @@ impl Expr {
     }
 
     /// and operation
-    pub fn and(self, expr: Expr) -> Self {
-        binary_expr(self, Operator::And, expr)
+    pub fn and<E: Into<Expr>>(self, expr: E) -> Self {
+        binary_expr(self, Operator::And, expr.into())
     }
 
     // xor operation
-    pub fn xor(self, expr: Expr) -> Self {
-        binary_expr(self, Operator::Xor, expr)
+    pub fn xor<E: Into<Expr>>(self, expr: E) -> Self {
+        binary_expr(self, Operator::Xor, expr.into())
     }
 
     /// or operation
-    pub fn or(self, expr: Expr) -> Self {
-        binary_expr(self, Operator::Or, expr)
+    pub fn or<E: Into<Expr>>(self, expr: E) -> Self {
+        binary_expr(self, Operator::Or, expr.into())
     }
 
     /// Raise expression to the power `exponent`
-    pub fn pow(self, exponent: f64) -> Self {
-        self.map(
-            move |s: Series| s.pow(exponent),
-            GetOutput::from_type(DataType::Float64),
-        )
-        .with_fmt("pow")
+    pub fn pow<E: Into<Expr>>(self, exponent: E) -> Self {
+        Expr::Function {
+            input: vec![self, exponent.into()],
+            function: FunctionExpr::Pow,
+            options: FunctionOptions {
+                collect_groups: ApplyOptions::ApplyFlat,
+                input_wildcard_expansion: false,
+                auto_explode: false,
+                fmt_str: "pow",
+            },
+        }
     }
 
     /// Filter a single column
     /// Should be used in aggregation context. If you want to filter on a DataFrame level, use
     /// [LazyFrame::filter](LazyFrame::filter)
-    pub fn filter(self, predicate: Expr) -> Self {
+    pub fn filter<E: Into<Expr>>(self, predicate: E) -> Self {
         if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
             panic!("filter '*' not allowed, use LazyFrame::filter")
         };
         Expr::Filter {
             input: Box::new(self),
-            by: Box::new(predicate),
+            by: Box::new(predicate.into()),
         }
     }
 
@@ -1101,7 +1215,8 @@ impl Expr {
     #[allow(clippy::wrong_self_convention)]
     #[cfg(feature = "is_in")]
     #[cfg_attr(docsrs, doc(cfg(feature = "is_in")))]
-    pub fn is_in(self, other: Expr) -> Self {
+    pub fn is_in<E: Into<Expr>>(self, other: E) -> Self {
+        let other = other.into();
         let has_literal = has_root_literal_expr(&other);
         if has_literal {
             if let Expr::Literal(LiteralValue::Series(s)) = &other {
@@ -1111,29 +1226,23 @@ impl Expr {
                 }
             }
         }
-
-        let f = |s: &mut [Series]| {
-            let left = &s[0];
-            let other = &s[1];
-
-            left.is_in(other).map(|ca| ca.into_series())
-        };
         let arguments = &[other];
-        let output_type = GetOutput::from_type(DataType::Boolean);
-
         // we don't have to apply on groups, so this is faster
         if has_literal {
-            self.map_many(f, arguments, output_type)
+            self.map_many_private(FunctionExpr::IsIn, arguments, "is_in_map")
         } else {
-            self.apply_many(f, arguments, output_type)
+            self.apply_many_private(FunctionExpr::IsIn, arguments, "is_in_apply")
         }
-        .with_fmt("is_in")
     }
 
     /// Sort this column by the ordering of another column.
     /// Can also be used in a groupby context to sort the groups.
-    pub fn sort_by<E: AsRef<[Expr]>, R: AsRef<[bool]>>(self, by: E, reverse: R) -> Expr {
-        let by = by.as_ref().to_vec();
+    pub fn sort_by<E: AsRef<[IE]>, IE: Into<Expr> + Clone, R: AsRef<[bool]>>(
+        self,
+        by: E,
+        reverse: R,
+    ) -> Expr {
+        let by = by.as_ref().iter().map(|e| e.clone().into()).collect();
         let reverse = reverse.as_ref().to_vec();
         Expr::SortBy {
             expr: Box::new(self),
@@ -1143,10 +1252,7 @@ impl Expr {
     }
 
     #[cfg(feature = "repeat_by")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "repeat_by")))]
-    /// Repeat the column `n` times, where `n` is determined by the values in `by`.
-    /// This yields an `Expr` of dtype `List`
-    pub fn repeat_by(self, by: Expr) -> Expr {
+    fn repeat_by_impl(self, by: Expr) -> Expr {
         let function = |s: &mut [Series]| {
             let by = &s[1];
             let s = &s[0];
@@ -1162,6 +1268,14 @@ impl Expr {
         .with_fmt("repeat_by")
     }
 
+    #[cfg(feature = "repeat_by")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "repeat_by")))]
+    /// Repeat the column `n` times, where `n` is determined by the values in `by`.
+    /// This yields an `Expr` of dtype `List`
+    pub fn repeat_by<E: Into<Expr>>(self, by: E) -> Expr {
+        self.repeat_by_impl(by.into())
+    }
+
     #[cfg(feature = "is_first")]
     #[cfg_attr(docsrs, doc(cfg(feature = "is_first")))]
     #[allow(clippy::wrong_self_convention)]
@@ -1175,12 +1289,17 @@ impl Expr {
     }
 
     #[cfg(feature = "dot_product")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dot_product")))]
-    pub fn dot(self, other: Expr) -> Expr {
+    fn dot_impl(self, other: Expr) -> Expr {
         let function = |s: &mut [Series]| Ok((&s[0] * &s[1]).sum_as_series());
 
         self.apply_many(function, &[other], GetOutput::same_type())
             .with_fmt("dot")
+    }
+
+    #[cfg(feature = "dot_product")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dot_product")))]
+    pub fn dot<E: Into<Expr>>(self, other: E) -> Expr {
+        self.dot_impl(other.into())
     }
 
     #[cfg(feature = "mode")]
@@ -1280,16 +1399,77 @@ impl Expr {
             .with_fmt("interpolate")
     }
 
+    fn finish_rolling(
+        self,
+        options: RollingOptions,
+        expr_name: &'static str,
+        expr_name_by: &'static str,
+        rolling_fn: Arc<dyn (Fn(&Series, RollingOptionsImpl) -> Result<Series>) + Send + Sync>,
+    ) -> Expr {
+        if let Some(ref by) = options.by {
+            self.apply_many(
+                move |s| {
+                    let mut by = s[1].clone();
+                    by = by.rechunk();
+                    let s = &s[0];
+
+                    if options.weights.is_some() {
+                        return Err(PolarsError::ComputeError(
+                            "weights not supported in 'rolling by' expression".into(),
+                        ));
+                    }
+
+                    if matches!(by.dtype(), DataType::Datetime(_, _)) {
+                        by = by.cast(&DataType::Datetime(TimeUnit::Microseconds, None))?;
+                    }
+                    let by = by.datetime().unwrap();
+                    let by_values = by.cont_slice().map_err(|_| {
+                        PolarsError::ComputeError(
+                            "'by' column should not have null values in 'rolling by'".into(),
+                        )
+                    })?;
+                    let tu = by.time_unit();
+
+                    let options = RollingOptionsImpl {
+                        window_size: options.window_size,
+                        min_periods: options.min_periods,
+                        weights: None,
+                        center: options.center,
+                        by: Some(by_values),
+                        tu: Some(tu),
+                        closed_window: options.closed_window,
+                    };
+
+                    rolling_fn(s, options)
+                },
+                &[col(by)],
+                GetOutput::same_type(),
+            )
+            .with_fmt(expr_name_by)
+        } else {
+            if !options.window_size.parsed_int {
+                panic!("if dynamic windows are used in a rolling aggregation, the 'by' argument must be set")
+            }
+
+            self.apply(
+                move |s| rolling_fn(&s, options.clone().into()),
+                GetOutput::same_type(),
+            )
+            .with_fmt(expr_name)
+        }
+    }
+
     /// Apply a rolling min See:
     /// [ChunkedArray::rolling_min]
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_min(self, options: RollingOptions) -> Expr {
-        self.apply(
-            move |s| s.rolling_min(options.clone()),
-            GetOutput::same_type(),
+        self.finish_rolling(
+            options,
+            "rolling_min",
+            "rolling_min_by",
+            Arc::new(|s, options| s.rolling_min(options)),
         )
-        .with_fmt("rolling_min")
     }
 
     /// Apply a rolling max See:
@@ -1297,11 +1477,12 @@ impl Expr {
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_max(self, options: RollingOptions) -> Expr {
-        self.apply(
-            move |s| s.rolling_max(options.clone()),
-            GetOutput::same_type(),
+        self.finish_rolling(
+            options,
+            "rolling_max",
+            "rolling_max_by",
+            Arc::new(|s, options| s.rolling_max(options)),
         )
-        .with_fmt("rolling_max")
     }
 
     /// Apply a rolling mean See:
@@ -1309,11 +1490,12 @@ impl Expr {
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_mean(self, options: RollingOptions) -> Expr {
-        self.apply(
-            move |s| s.rolling_mean(options.clone()),
-            GetOutput::same_type(),
+        self.finish_rolling(
+            options,
+            "rolling_mean",
+            "rolling_mean_by",
+            Arc::new(|s, options| s.rolling_mean(options)),
         )
-        .with_fmt("rolling_mean")
     }
 
     /// Apply a rolling sum See:
@@ -1321,11 +1503,12 @@ impl Expr {
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_sum(self, options: RollingOptions) -> Expr {
-        self.apply(
-            move |s| s.rolling_sum(options.clone()),
-            GetOutput::same_type(),
+        self.finish_rolling(
+            options,
+            "rolling_sum",
+            "rolling_sum_by",
+            Arc::new(|s, options| s.rolling_sum(options)),
         )
-        .with_fmt("rolling_sum")
     }
 
     /// Apply a rolling median See:
@@ -1333,11 +1516,12 @@ impl Expr {
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_median(self, options: RollingOptions) -> Expr {
-        self.apply(
-            move |s| s.rolling_median(options.clone()),
-            GetOutput::same_type(),
+        self.finish_rolling(
+            options,
+            "rolling_median",
+            "rolling_median_by",
+            Arc::new(|s, options| s.rolling_median(options)),
         )
-        .with_fmt("rolling_median")
     }
 
     /// Apply a rolling quantile See:
@@ -1350,43 +1534,36 @@ impl Expr {
         interpolation: QuantileInterpolOptions,
         options: RollingOptions,
     ) -> Expr {
-        self.apply(
-            move |s| s.rolling_quantile(quantile, interpolation, options.clone()),
-            GetOutput::same_type(),
+        self.finish_rolling(
+            options,
+            "rolling_quantile",
+            "rolling_quantile_by",
+            Arc::new(move |s, options| s.rolling_quantile(quantile, interpolation, options)),
         )
-        .with_fmt("rolling_quantile")
     }
 
     /// Apply a rolling variance
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_var(self, options: RollingOptions) -> Expr {
-        self.to_float()
-            .apply(
-                move |s| match s.dtype() {
-                    DataType::Float32 => s.f32().unwrap().rolling_var(options.clone()),
-                    DataType::Float64 => s.f64().unwrap().rolling_var(options.clone()),
-                    _ => unreachable!(),
-                },
-                GetOutput::same_type(),
-            )
-            .with_fmt("rolling_var")
+        self.finish_rolling(
+            options,
+            "rolling_var",
+            "rolling_var_by",
+            Arc::new(|s, options| s.rolling_var(options)),
+        )
     }
 
     /// Apply a rolling std-dev
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_std(self, options: RollingOptions) -> Expr {
-        self.to_float()
-            .apply(
-                move |s| match s.dtype() {
-                    DataType::Float32 => s.f32().unwrap().rolling_std(options.clone()),
-                    DataType::Float64 => s.f64().unwrap().rolling_std(options.clone()),
-                    _ => unreachable!(),
-                },
-                GetOutput::same_type(),
-            )
-            .with_fmt("rolling_std")
+        self.finish_rolling(
+            options,
+            "rolling_std",
+            "rolling_std_by",
+            Arc::new(|s, options| s.rolling_std(options)),
+        )
     }
 
     #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
@@ -1397,7 +1574,7 @@ impl Expr {
         self,
         f: Arc<dyn Fn(&Series) -> Series + Send + Sync>,
         output_type: GetOutput,
-        options: RollingOptions,
+        options: RollingOptionsFixedWindow,
     ) -> Expr {
         self.apply(
             move |s| s.rolling_apply(f.as_ref(), options.clone()),
@@ -1636,9 +1813,15 @@ impl Expr {
     }
 
     #[cfg(feature = "random")]
-    pub fn sample_frac(self, frac: f64, with_replacement: bool, seed: Option<u64>) -> Self {
+    pub fn sample_frac(
+        self,
+        frac: f64,
+        with_replacement: bool,
+        shuffle: bool,
+        seed: Option<u64>,
+    ) -> Self {
         self.apply(
-            move |s| s.sample_frac(frac, with_replacement, seed),
+            move |s| s.sample_frac(frac, with_replacement, shuffle, seed),
             GetOutput::same_type(),
         )
         .with_fmt("shuffle")
@@ -1793,11 +1976,28 @@ impl Expr {
 
     #[cfg(feature = "log")]
     #[cfg_attr(docsrs, doc(cfg(feature = "log")))]
+    /// Calculate the exponential of all elements in the input array
+    pub fn exp(self) -> Self {
+        self.map(
+            move |s| Ok(s.exp()),
+            GetOutput::map_dtype(|dt| {
+                if matches!(dt, DataType::Float32) {
+                    DataType::Float32
+                } else {
+                    DataType::Float64
+                }
+            }),
+        )
+        .with_fmt("log")
+    }
+
+    #[cfg(feature = "log")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "log")))]
     /// Compute the entropy as `-sum(pk * log(pk)`.
     /// where `pk` are discrete probabilities.
-    pub fn entropy(self, base: f64) -> Self {
+    pub fn entropy(self, base: f64, normalize: bool) -> Self {
         self.apply(
-            move |s| Ok(Series::new(s.name(), [s.entropy(base)])),
+            move |s| Ok(Series::new(s.name(), [s.entropy(base, normalize)])),
             GetOutput::map_dtype(|dt| {
                 if matches!(dt, DataType::Float32) {
                     DataType::Float32
@@ -1819,6 +2019,31 @@ impl Expr {
                 options.auto_explode = true;
                 options
             })
+    }
+
+    /// Set this `Series` as `sorted` so that downstream code can use
+    /// fast paths for sorted arrays.
+    /// # Warning
+    /// This can lead to incorrect results if this `Series` is not sorted!!
+    /// Use with care!
+    pub fn set_sorted(self, sorted: IsSorted) -> Expr {
+        self.apply(
+            move |mut s| {
+                match sorted {
+                    IsSorted::Not => {}
+                    IsSorted::Ascending => s.set_sorted(false),
+                    IsSorted::Descending => s.set_sorted(true),
+                }
+                Ok(s)
+            },
+            GetOutput::same_type(),
+        )
+    }
+
+    #[cfg(feature = "row_hash")]
+    /// Compute the hash of every element
+    pub fn hash(self, seed: usize) -> Expr {
+        self.map_private(FunctionExpr::Hash(seed), "hash")
     }
 
     #[cfg(feature = "strings")]

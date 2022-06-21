@@ -245,6 +245,7 @@ pub fn test_slice_pushdown_sort() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "dtype-i16")]
 pub fn test_predicate_block_cast() -> Result<()> {
     let df = df![
         "value" => [10, 20, 30, 40]
@@ -253,12 +254,12 @@ pub fn test_predicate_block_cast() -> Result<()> {
     let lf1 = df
         .clone()
         .lazy()
-        .with_column(col("value") * lit(0.1f32))
+        .with_column(col("value").cast(DataType::Int16) * lit(0.1f32))
         .filter(col("value").lt(lit(2.5f32)));
 
     let lf2 = df
         .lazy()
-        .select([col("value") * lit(0.1f32)])
+        .select([col("value").cast(DataType::Int16) * lit(0.1f32)])
         .filter(col("value").lt(lit(2.5f32)));
 
     for lf in [lf1, lf2] {
@@ -374,6 +375,53 @@ fn test_with_row_count_opts() -> Result<()> {
             .collect::<Vec<_>>(),
         &[0]
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_groupby_ternary_literal_predicate() -> Result<()> {
+    let df = df![
+        "a" => [1, 2, 3],
+        "b" => [1, 2, 3]
+    ]?;
+
+    for predicate in [true, false] {
+        let q = df
+            .clone()
+            .lazy()
+            .groupby(["a"])
+            .agg([when(lit(predicate))
+                .then(col("b").sum())
+                .otherwise(NULL.lit())])
+            .sort("a", Default::default());
+
+        let (mut expr_arena, mut lp_arena) = get_arenas();
+        let lp = q.clone().optimize(&mut lp_arena, &mut expr_arena).unwrap();
+
+        (&lp_arena).iter(lp).any(|(_, lp)| {
+            use ALogicalPlan::*;
+            match lp {
+                Aggregate { aggs, .. } => {
+                    for node in aggs {
+                        // we should not have a ternary expression anymore
+                        assert!(!matches!(expr_arena.get(*node), AExpr::Ternary { .. }));
+                    }
+                    false
+                }
+                _ => false,
+            }
+        });
+
+        let out = q.collect()?;
+        let b = out.column("b")?;
+        let b = b.i32()?;
+        if predicate {
+            assert_eq!(Vec::from(b), &[Some(1), Some(2), Some(3)]);
+        } else {
+            assert_eq!(b.null_count(), 3);
+        };
+    }
 
     Ok(())
 }

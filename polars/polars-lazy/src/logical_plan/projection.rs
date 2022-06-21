@@ -3,7 +3,7 @@ use super::*;
 use crate::utils::has_nth;
 use polars_arrow::index::IndexToUsize;
 
-/// This replace the wilcard Expr with a Column Expr. It also removes the Exclude Expr from the
+/// This replace the wildcard Expr with a Column Expr. It also removes the Exclude Expr from the
 /// expression chain.
 pub(super) fn replace_wildcard_with_column(mut expr: Expr, column_name: Arc<str>) -> Expr {
     expr.mutate().apply(|e| {
@@ -51,9 +51,9 @@ fn rewrite_special_aliases(expr: Expr) -> Expr {
 /// Take an expression with a root: col("*") and copies that expression for all columns in the schema,
 /// with the exclusion of the `names` in the exclude expression.
 /// The resulting expressions are written to result.
-fn replace_wilcard(expr: &Expr, result: &mut Vec<Expr>, exclude: &[Arc<str>], schema: &Schema) {
+fn replace_wildcard(expr: &Expr, result: &mut Vec<Expr>, exclude: &[Arc<str>], schema: &Schema) {
     for name in schema.iter_names() {
-        if !exclude.iter().any(|exluded| &**exluded == name) {
+        if !exclude.iter().any(|excluded| &**excluded == name) {
             let new_expr = replace_wildcard_with_column(expr.clone(), Arc::from(name.as_str()));
             let new_expr = rewrite_special_aliases(new_expr);
             result.push(new_expr)
@@ -145,12 +145,7 @@ fn expand_columns(expr: &Expr, result: &mut Vec<Expr>, names: &[String]) {
 /// replace `DtypeColumn` with `col("foo")..col("bar")`
 fn expand_dtypes(expr: &Expr, result: &mut Vec<Expr>, schema: &Schema, dtypes: &[DataType]) {
     for dtype in dtypes {
-        // we compare by variant not by exact datatype as units/ refmaps etc may differ.
-        let variant = std::mem::discriminant(dtype);
-        for field in schema
-            .iter_fields()
-            .filter(|f| std::mem::discriminant(f.data_type()) == variant)
-        {
+        for field in schema.iter_fields().filter(|f| f.data_type() == dtype) {
             let name = field.name();
 
             let mut new_expr = expr.clone();
@@ -245,7 +240,10 @@ fn prepare_excluded(expr: &Expr, schema: &Schema, keys: &[Expr]) -> Vec<Arc<str>
 fn expand_function_list_inputs(mut expr: Expr, schema: &Schema) -> Expr {
     expr.mutate().apply(|e| {
         match e {
-            Expr::AnonymousFunction { input, options, .. } if options.input_wildcard_expansion => {
+            Expr::AnonymousFunction { input, options, .. }
+            | Expr::Function { input, options, .. }
+                if options.input_wildcard_expansion =>
+            {
                 if input
                     .iter()
                     .any(|e| matches!(e, Expr::Columns(_) | Expr::DtypeColumn(_)))
@@ -291,7 +289,10 @@ fn expand_function_list_inputs(mut expr: Expr, schema: &Schema) -> Expr {
 fn function_wildcard_expansion(mut expr: Expr, schema: &Schema, exclude: &[Arc<str>]) -> Expr {
     expr.mutate().apply(|e| {
         match e {
-            Expr::AnonymousFunction { input, options, .. } if options.input_wildcard_expansion => {
+            Expr::AnonymousFunction { input, options, .. }
+            | Expr::Function { input, options, .. }
+                if options.input_wildcard_expansion =>
+            {
                 let mut new_inputs = Vec::with_capacity(input.len());
 
                 input.iter_mut().for_each(|e| {
@@ -305,7 +306,7 @@ fn function_wildcard_expansion(mut expr: Expr, schema: &Schema, exclude: &[Arc<s
                         }
                         _ => {
                             if has_wildcard(e) {
-                                replace_wilcard(e, &mut new_inputs, exclude, schema)
+                                replace_wildcard(e, &mut new_inputs, exclude, schema)
                             } else {
                                 #[cfg(feature = "regex")]
                                 {
@@ -356,19 +357,21 @@ pub(crate) fn rewrite_projections(exprs: Vec<Expr>, schema: &Schema, keys: &[Exp
             replace_nth(&mut expr, schema);
         }
 
-        if has_wildcard(&expr) {
+        let function_input_expansion = has_expr(
+            &expr,
+            |e| matches!(e, Expr::AnonymousFunction { options,  .. } | Expr::Function {options, ..} if options.input_wildcard_expansion),
+        );
+
+        if has_wildcard(&expr) || function_input_expansion {
             // keep track of column excluded from the wildcard
             let exclude = prepare_excluded(&expr, schema, keys);
             // this path prepares the wildcard as input for the Function Expr
-            if has_expr(
-                &expr,
-                |e| matches!(e, Expr::AnonymousFunction { options,  .. } if options.input_wildcard_expansion),
-            ) {
+            if function_input_expansion {
                 expr = function_wildcard_expansion(expr, schema, &exclude);
                 result.push(expr);
                 continue;
             }
-            replace_wilcard(&expr, &mut result, &exclude, schema);
+            replace_wildcard(&expr, &mut result, &exclude, schema);
         } else {
             #[allow(clippy::collapsible_else_if)]
             #[cfg(feature = "regex")]

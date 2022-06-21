@@ -1,3 +1,4 @@
+#![feature(vec_into_raw_parts)]
 #![allow(clippy::nonstandard_macro_braces)] // needed because clippy does not understand proc macro of pyo3
 #![allow(clippy::transmute_undefined_repr)]
 #[macro_use]
@@ -35,21 +36,26 @@ pub mod utils;
 
 use crate::conversion::{get_df, get_lf, get_pyseq, get_series, Wrap};
 use crate::error::{
-    ArrowErrorException, ComputeError, NoDataError, NotFoundError, PyPolarsErr, SchemaError,
+    ArrowErrorException, ComputeError, DuplicateError, NoDataError, NotFoundError, PyPolarsErr,
+    SchemaError,
 };
 use crate::file::get_either_file;
-use crate::prelude::{ClosedWindow, DataType, DatetimeArgs, Duration, DurationArgs, PyDataType};
+use crate::prelude::{
+    vec_extract_wrapped, ClosedWindow, DataType, DatetimeArgs, Duration, DurationArgs,
+};
 use dsl::ToExprs;
+#[cfg(target_os = "linux")]
+use jemallocator::Jemalloc;
 #[cfg(not(target_os = "linux"))]
 use mimalloc::MiMalloc;
 use polars::functions::{diag_concat_df, hor_concat_df};
 use polars::prelude::Null;
 use polars_core::datatypes::TimeUnit;
-use polars_core::export::arrow::io::ipc::read::read_file_metadata;
+use polars_core::prelude::DataFrame;
 use polars_core::prelude::IntoSeries;
+use polars_core::POOL;
+use pyo3::panic::PanicException;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyString};
-#[cfg(target_os = "linux")]
-use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
 #[cfg(target_os = "linux")]
@@ -85,19 +91,15 @@ fn cols(names: Vec<String>) -> dsl::PyExpr {
 }
 
 #[pyfunction]
-fn dtype_cols(dtypes: &PyAny) -> PyResult<dsl::PyExpr> {
-    let (seq, len) = get_pyseq(dtypes)?;
-    let iter = seq.iter()?;
-
-    let mut dtypes = Vec::with_capacity(len);
-
-    for res in iter {
-        let item = res?;
-        let pydt = item.extract::<PyDataType>()?;
-        let dt: DataType = pydt.into();
-        dtypes.push(dt)
-    }
+fn dtype_cols(dtypes: Vec<Wrap<DataType>>) -> PyResult<dsl::PyExpr> {
+    let dtypes = vec_extract_wrapped(dtypes);
     Ok(dsl::dtype_cols(dtypes))
+}
+
+#[pyfunction]
+fn dtype_str_repr(dtype: Wrap<DataType>) -> PyResult<String> {
+    let dtype = dtype.0;
+    Ok(dtype.to_string())
 }
 
 #[pyfunction]
@@ -200,13 +202,13 @@ fn toggle_string_cache(toggle: bool) {
 
 #[pyfunction]
 fn concat_str(s: Vec<dsl::PyExpr>, sep: &str) -> dsl::PyExpr {
-    let s = s.into_iter().map(|e| e.inner).collect();
+    let s = s.into_iter().map(|e| e.inner).collect::<Vec<_>>();
     polars::lazy::dsl::concat_str(s, sep).into()
 }
 
 #[pyfunction]
 fn concat_lst(s: Vec<dsl::PyExpr>) -> dsl::PyExpr {
-    let s = s.into_iter().map(|e| e.inner).collect();
+    let s = s.into_iter().map(|e| e.inner).collect::<Vec<_>>();
     polars::lazy::dsl::concat_lst(s).into()
 }
 
@@ -262,18 +264,43 @@ fn py_duration(
 }
 
 #[pyfunction]
-fn concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
+fn concat_df(dfs: &PyAny, py: Python) -> PyResult<PyDataFrame> {
+    use polars_core::{error::Result, utils::rayon::prelude::*};
+
     let (seq, _len) = get_pyseq(dfs)?;
     let mut iter = seq.iter()?;
     let first = iter.next().unwrap()?;
 
-    let mut df = get_df(first)?;
+    let first_rdf = get_df(first)?;
+    let identity_df = first_rdf.slice(0, 0);
 
-    for res in iter {
-        let item = res?;
-        let other = get_df(item)?;
-        df.vstack_mut(&other).map_err(PyPolarsErr::from)?;
+    let mut rdfs: Vec<Result<DataFrame>> = vec![Ok(first_rdf)];
+
+    for item in iter {
+        let rdf = get_df(item?)?;
+        rdfs.push(Ok(rdf));
     }
+
+    let identity = || Ok(identity_df.clone());
+
+    let df = py
+        .allow_threads(|| {
+            polars_core::POOL.install(|| {
+                rdfs.into_par_iter()
+                    .fold(identity, |acc: Result<DataFrame>, df| {
+                        let mut acc = acc?;
+                        acc.vstack_mut(&df?)?;
+                        Ok(acc)
+                    })
+                    .reduce(identity, |acc, df| {
+                        let mut acc = acc?;
+                        acc.vstack_mut(&df?)?;
+                        Ok(acc)
+                    })
+            })
+        })
+        .map_err(PyPolarsErr::from)?;
+
     Ok(df.into())
 }
 
@@ -342,6 +369,7 @@ fn concat_series(series: &PyAny) -> PyResult<PySeries> {
 
 #[pyfunction]
 fn ipc_schema(py: Python, py_f: PyObject) -> PyResult<PyObject> {
+    use polars_core::export::arrow::io::ipc::read::read_file_metadata;
     let metadata = match get_either_file(py_f, false)? {
         EitherRustPythonFile::Rust(mut r) => {
             read_file_metadata(&mut r).map_err(PyPolarsErr::from)?
@@ -351,6 +379,24 @@ fn ipc_schema(py: Python, py_f: PyObject) -> PyResult<PyObject> {
 
     let dict = PyDict::new(py);
     for field in metadata.schema.fields {
+        let dt: Wrap<DataType> = Wrap((&field.data_type).into());
+        dict.set_item(field.name, dt.to_object(py))?;
+    }
+    Ok(dict.to_object(py))
+}
+
+#[pyfunction]
+fn parquet_schema(py: Python, py_f: PyObject) -> PyResult<PyObject> {
+    use polars_core::export::arrow::io::parquet::read::{infer_schema, read_metadata};
+
+    let metadata = match get_either_file(py_f, false)? {
+        EitherRustPythonFile::Rust(mut r) => read_metadata(&mut r).map_err(PyPolarsErr::from)?,
+        EitherRustPythonFile::Py(mut r) => read_metadata(&mut r).map_err(PyPolarsErr::from)?,
+    };
+    let arrow_schema = infer_schema(&metadata).map_err(PyPolarsErr::from)?;
+
+    let dict = PyDict::new(py);
+    for field in arrow_schema.fields {
         let dt: Wrap<DataType> = Wrap((&field.data_type).into());
         dict.set_item(field.name, dt.to_object(py))?;
     }
@@ -394,14 +440,9 @@ fn py_date_range(
     every: &str,
     closed: Wrap<ClosedWindow>,
     name: &str,
-    tu: &str,
+    tu: Wrap<TimeUnit>,
 ) -> PySeries {
-    let tu = match tu {
-        "ns" => TimeUnit::Nanoseconds,
-        "ms" => TimeUnit::Milliseconds,
-        _ => panic!("{}", "expected one of {'ns', 'ms'}"),
-    };
-    polars::time::date_range_impl(name, start, stop, Duration::parse(every), closed.0, tu)
+    polars::time::date_range_impl(name, start, stop, Duration::parse(every), closed.0, tu.0)
         .into_series()
         .into()
 }
@@ -424,6 +465,11 @@ fn as_struct(exprs: Vec<PyExpr>) -> PyExpr {
     polars::lazy::dsl::as_struct(&exprs).into()
 }
 
+#[pyfunction]
+fn pool_size() -> usize {
+    POOL.current_num_threads()
+}
+
 #[pymodule]
 fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add("NotFoundError", py.get_type::<NotFoundError>())
@@ -436,6 +482,10 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add("SchemaError", py.get_type::<SchemaError>()).unwrap();
     m.add("ArrowError", py.get_type::<ArrowErrorException>())
         .unwrap();
+    m.add("DuplicateError", py.get_type::<DuplicateError>())
+        .unwrap();
+    m.add("PanicException", py.get_type::<PanicException>())
+        .unwrap();
     m.add_class::<PySeries>().unwrap();
     m.add_class::<PyDataFrame>().unwrap();
     m.add_class::<PyLazyFrame>().unwrap();
@@ -447,6 +497,7 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(last)).unwrap();
     m.add_wrapped(wrap_pyfunction!(cols)).unwrap();
     m.add_wrapped(wrap_pyfunction!(dtype_cols)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(dtype_str_repr)).unwrap();
     m.add_wrapped(wrap_pyfunction!(lit)).unwrap();
     m.add_wrapped(wrap_pyfunction!(fold)).unwrap();
     m.add_wrapped(wrap_pyfunction!(binary_expr)).unwrap();
@@ -465,6 +516,7 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(concat_lf)).unwrap();
     m.add_wrapped(wrap_pyfunction!(concat_series)).unwrap();
     m.add_wrapped(wrap_pyfunction!(ipc_schema)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(parquet_schema)).unwrap();
     m.add_wrapped(wrap_pyfunction!(collect_all)).unwrap();
     m.add_wrapped(wrap_pyfunction!(spearman_rank_corr)).unwrap();
     m.add_wrapped(wrap_pyfunction!(map_mul)).unwrap();
@@ -477,5 +529,6 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(max_exprs)).unwrap();
     m.add_wrapped(wrap_pyfunction!(as_struct)).unwrap();
     m.add_wrapped(wrap_pyfunction!(repeat)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(pool_size)).unwrap();
     Ok(())
 }

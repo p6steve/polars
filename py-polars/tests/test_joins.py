@@ -1,3 +1,5 @@
+import numpy as np
+
 import polars as pl
 
 
@@ -45,3 +47,68 @@ def test_semi_anti_join() -> None:
         "b": ["c"],
         "payload": [30],
     }
+
+
+def test_join_same_cat_src() -> None:
+    df = pl.DataFrame(
+        data={"column": ["a", "a", "b"], "more": [1, 2, 3]},
+        columns=[("column", pl.Categorical), ("more", pl.Int32)],
+    )
+    df_agg = df.groupby("column").agg(pl.col("more").mean())
+    assert df.join(df_agg, on="column").to_dict(False) == {
+        "column": ["a", "a", "b"],
+        "more": [1, 2, 3],
+        "more_right": [1.5, 1.5, 3.0],
+    }
+
+
+def test_sorted_merge_joins() -> None:
+    for reverse in [False, True]:
+        n = 30
+        df_a = pl.DataFrame(
+            {"a": np.sort(np.random.randint(0, n // 2, n))}
+        ).with_row_count("row_a")
+
+        df_b = pl.DataFrame(
+            {"a": np.sort(np.random.randint(0, n // 2, n // 2))}
+        ).with_row_count("row_b")
+
+        if reverse:
+            df_a = df_a.select(pl.all().reverse())
+            df_b = df_b.select(pl.all().reverse())
+
+        for how in ["left", "inner"]:
+            # hash join
+            out_hash_join = df_a.join(df_b, on="a", how=how)
+
+            # sorted merge join
+            out_sorted_merge_join = df_a.with_column(
+                pl.col("a").set_sorted(reverse)
+            ).join(df_b.with_column(pl.col("a").set_sorted(reverse)), on="a", how=how)
+
+            assert out_hash_join.frame_equal(out_sorted_merge_join)
+
+
+def test_join_negative_integers() -> None:
+    expected = {"a": [-6, -1, 0], "b": [-6, -1, 0]}
+
+    df1 = pl.DataFrame(
+        {
+            "a": [-1, -6, -3, 0],
+        }
+    )
+
+    df2 = pl.DataFrame(
+        {
+            "a": [-6, -1, -4, -2, 0],
+            "b": [-6, -1, -4, -2, 0],
+        }
+    )
+
+    for dt in [pl.Int8, pl.Int16, pl.Int32, pl.Int64]:
+        assert (
+            df1.with_column(pl.all().cast(dt))
+            .join(df2.with_column(pl.all().cast(dt)), on="a", how="inner")
+            .to_dict(False)
+            == expected
+        )

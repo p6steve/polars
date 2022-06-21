@@ -1,33 +1,39 @@
 //! kernels that combine take and aggregations.
 use crate::array::PolarsArray;
+use crate::index::IdxSize;
 use arrow::array::PrimitiveArray;
 use arrow::types::NativeType;
+use num::{NumCast, ToPrimitive};
 
 /// Take kernel for single chunk without nulls and an iterator as index.
 /// # Safety
 /// caller must enure iterators indexes are in bounds
 #[inline]
 pub unsafe fn take_agg_no_null_primitive_iter_unchecked<
-    T: NativeType,
+    T: NativeType + ToPrimitive,
+    TOut: NumCast + NativeType,
     I: IntoIterator<Item = usize>,
-    F: Fn(T, T) -> T,
+    F: Fn(TOut, TOut) -> TOut,
 >(
     arr: &PrimitiveArray<T>,
     indices: I,
     f: F,
-    init: T,
-) -> T {
+    init: TOut,
+) -> TOut {
     debug_assert!(!arr.has_validity());
     let array_values = arr.values().as_slice();
 
-    indices
-        .into_iter()
-        .fold(init, |acc, idx| f(acc, *array_values.get_unchecked(idx)))
+    indices.into_iter().fold(init, |acc, idx| {
+        f(
+            acc,
+            NumCast::from(*array_values.get_unchecked(idx)).unwrap_unchecked(),
+        )
+    })
 }
 
 /// Take kernel for single chunk and an iterator as index.
 /// # Safety
-/// caller must enure iterators indexes are in bounds
+/// caller must ensure iterators indexes are in bounds
 #[inline]
 pub unsafe fn take_agg_primitive_iter_unchecked<
     T: NativeType,
@@ -38,18 +44,21 @@ pub unsafe fn take_agg_primitive_iter_unchecked<
     indices: I,
     f: F,
     init: T,
+    len: IdxSize,
 ) -> Option<T> {
     let array_values = arr.values().as_slice();
     let validity = arr.validity().expect("null buffer should be there");
+    let mut null_count = 0 as IdxSize;
 
     let out = indices.into_iter().fold(init, |acc, idx| {
         if validity.get_bit_unchecked(idx) {
             f(acc, *array_values.get_unchecked(idx))
         } else {
+            null_count += 1;
             acc
         }
     });
-    if out == init {
+    if null_count == len {
         None
     } else {
         Some(out)
@@ -61,28 +70,33 @@ pub unsafe fn take_agg_primitive_iter_unchecked<
 /// caller must enure iterators indexes are in bounds
 #[inline]
 pub unsafe fn take_agg_primitive_iter_unchecked_count_nulls<
-    T: NativeType,
+    T: NativeType + ToPrimitive,
+    TOut: NumCast + NativeType,
     I: IntoIterator<Item = usize>,
-    F: Fn(T, T) -> T,
+    F: Fn(TOut, TOut) -> TOut,
 >(
     arr: &PrimitiveArray<T>,
     indices: I,
     f: F,
-    init: T,
-) -> Option<(T, u32)> {
+    init: TOut,
+    len: IdxSize,
+) -> Option<(TOut, IdxSize)> {
     let array_values = arr.values().as_slice();
     let validity = arr.validity().expect("null buffer should be there");
 
-    let mut null_count = 0;
+    let mut null_count = 0 as IdxSize;
     let out = indices.into_iter().fold(init, |acc, idx| {
         if validity.get_bit_unchecked(idx) {
-            f(acc, *array_values.get_unchecked(idx))
+            f(
+                acc,
+                NumCast::from(*array_values.get_unchecked(idx)).unwrap_unchecked(),
+            )
         } else {
             null_count += 1;
             acc
         }
     });
-    if out == init {
+    if null_count == len {
         None
     } else {
         Some((out, null_count))

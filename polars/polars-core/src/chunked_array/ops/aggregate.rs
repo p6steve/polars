@@ -391,6 +391,10 @@ where
         + compute::aggregate::SimdOrd<T::Native>,
 {
     fn var(&self) -> Option<f64> {
+        if self.len() == 1 {
+            return Some(0.0);
+        }
+
         let mean = self.mean()?;
         let squared = self.apply_cast_numeric::<_, Float64Type>(|value| {
             (value.to_f64().unwrap() - mean).powf(2.0)
@@ -409,6 +413,10 @@ where
 
 impl ChunkVar<f32> for Float32Chunked {
     fn var(&self) -> Option<f32> {
+        if self.len() == 1 {
+            return Some(0.0);
+        }
+
         let mean = self.mean()? as f32;
         let squared = self.apply(|value| (value - mean).powf(2.0));
         squared
@@ -422,6 +430,10 @@ impl ChunkVar<f32> for Float32Chunked {
 
 impl ChunkVar<f64> for Float64Chunked {
     fn var(&self) -> Option<f64> {
+        if self.len() == 1 {
+            return Some(0.0);
+        }
+
         let mean = self.mean()?;
         let squared = self.apply(|value| (value - mean).powf(2.0));
         squared
@@ -439,52 +451,46 @@ impl ChunkVar<Series> for ListChunked {}
 impl<T> ChunkVar<Series> for ObjectChunked<T> {}
 impl ChunkVar<bool> for BooleanChunked {}
 
-fn min_max_helper(ca: &BooleanChunked, min: bool) -> u32 {
-    ca.into_iter().fold(0, |acc: u32, x| match x {
-        Some(v) => {
-            let v = v as u32;
-            if min {
-                if acc < v {
-                    acc
-                } else {
-                    v
-                }
-            } else if acc > v {
-                acc
-            } else {
-                v
-            }
-        }
-        None => acc,
-    })
-}
-
 /// Booleans are casted to 1 or 0.
-impl ChunkAgg<u32> for BooleanChunked {
+impl ChunkAgg<IdxSize> for BooleanChunked {
     /// Returns `None` if the array is empty or only contains null values.
-    fn sum(&self) -> Option<u32> {
+    fn sum(&self) -> Option<IdxSize> {
         if self.is_empty() {
-            return None;
+            None
+        } else {
+            Some(
+                self.downcast_iter()
+                    .map(|arr| match arr.validity() {
+                        Some(validity) => {
+                            (arr.len() - (validity & arr.values()).null_count()) as IdxSize
+                        }
+                        None => (arr.len() - arr.values().null_count()) as IdxSize,
+                    })
+                    .sum(),
+            )
         }
-        let sum = self.into_iter().fold(0, |acc: u32, x| match x {
-            Some(v) => acc + v as u32,
-            None => acc,
-        });
-        Some(sum)
     }
 
-    fn min(&self) -> Option<u32> {
+    fn min(&self) -> Option<IdxSize> {
         if self.is_empty() {
             return None;
         }
-        Some(min_max_helper(self, true))
+        if self.all() {
+            Some(1)
+        } else {
+            Some(0)
+        }
     }
 
-    fn max(&self) -> Option<u32> {
+    fn max(&self) -> Option<IdxSize> {
         if self.is_empty() {
             return None;
         }
-        Some(min_max_helper(self, false))
+        if self.any() {
+            Some(1)
+        } else {
+            Some(0)
+        }
     }
 }
 
@@ -727,19 +733,19 @@ impl QuantileAggSeries for Utf8Chunked {
 impl ChunkAggSeries for BooleanChunked {
     fn sum_as_series(&self) -> Series {
         let v = ChunkAgg::sum(self);
-        let mut ca: UInt32Chunked = [v].iter().copied().collect();
+        let mut ca: IdxCa = [v].iter().copied().collect();
         ca.rename(self.name());
         ca.into_series()
     }
     fn max_as_series(&self) -> Series {
         let v = ChunkAgg::max(self);
-        let mut ca: UInt32Chunked = [v].iter().copied().collect();
+        let mut ca: IdxCa = [v].iter().copied().collect();
         ca.rename(self.name());
         ca.into_series()
     }
     fn min_as_series(&self) -> Series {
         let v = ChunkAgg::min(self);
-        let mut ca: UInt32Chunked = [v].iter().copied().collect();
+        let mut ca: IdxCa = [v].iter().copied().collect();
         ca.rename(self.name());
         ca.into_series()
     }
@@ -766,8 +772,8 @@ impl ChunkAggSeries for Utf8Chunked {
 }
 
 macro_rules! one_null_list {
-    ($self:ident) => {{
-        let mut builder = get_list_builder(&DataType::Null, 0, 1, $self.name());
+    ($self:ident, $dtype: expr) => {{
+        let mut builder = get_list_builder(&$dtype, 0, 1, $self.name()).unwrap();
         builder.append_opt_series(None);
         builder.finish().into_series()
     }};
@@ -775,13 +781,13 @@ macro_rules! one_null_list {
 
 impl ChunkAggSeries for ListChunked {
     fn sum_as_series(&self) -> Series {
-        one_null_list!(self)
+        one_null_list!(self, self.inner_dtype())
     }
     fn max_as_series(&self) -> Series {
-        one_null_list!(self)
+        one_null_list!(self, self.inner_dtype())
     }
     fn min_as_series(&self) -> Series {
-        one_null_list!(self)
+        one_null_list!(self, self.inner_dtype())
     }
 }
 

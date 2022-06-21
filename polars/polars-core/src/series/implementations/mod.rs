@@ -27,8 +27,6 @@ use super::IntoSeries;
 use super::SeriesTrait;
 use super::*;
 use crate::chunked_array::comparison::*;
-#[cfg(feature = "rolling_window")]
-use crate::chunked_array::ops::rolling_window::RollingOptions;
 use crate::chunked_array::{
     ops::{
         aggregate::{ChunkAggSeries, QuantileAggSeries, VarAggSeries},
@@ -44,7 +42,6 @@ use crate::prelude::*;
 #[cfg(feature = "checked_arithmetic")]
 use crate::series::arithmetic::checked::NumOpsDispatchChecked;
 use ahash::RandomState;
-use arrow::array::ArrayRef;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use std::borrow::Cow;
 use std::ops::Deref;
@@ -87,47 +84,6 @@ macro_rules! impl_dyn_series {
             fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
                 self.0.explode_by_offsets(offsets)
             }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_sum(&self, options: RollingOptions) -> Result<Series> {
-                self.0.rolling_sum(options)
-            }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_median(&self, options: RollingOptions) -> Result<Series> {
-                self.0.rolling_median(options)
-            }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_quantile(
-                &self,
-                quantile: f64,
-                interpolation: QuantileInterpolOptions,
-                options: RollingOptions,
-            ) -> Result<Series> {
-                self.0.rolling_quantile(quantile, interpolation, options)
-            }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_min(&self, options: RollingOptions) -> Result<Series> {
-                self.0.rolling_min(options)
-            }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_max(&self, options: RollingOptions) -> Result<Series> {
-                self.0.rolling_max(options)
-            }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_std(&self, options: RollingOptions) -> Result<Series> {
-                let s = self.cast(&DataType::Float64).unwrap();
-                s.f64().unwrap().rolling_std(options)
-            }
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_mean(&self, options: RollingOptions) -> Result<Series> {
-                let s = self.cast(&DataType::Float64).unwrap();
-                s.f64().unwrap().rolling_mean(options)
-            }
-
-            #[cfg(feature = "rolling_window")]
-            fn _rolling_var(&self, options: RollingOptions) -> Result<Series> {
-                let s = self.cast(&DataType::Float64).unwrap();
-                s.f64().unwrap().rolling_var(options)
-            }
 
             #[cfg(feature = "cum_agg")]
             fn _cummax(&self, reverse: bool) -> Series {
@@ -139,7 +95,20 @@ macro_rules! impl_dyn_series {
                 self.0.cummin(reverse).into_series()
             }
 
-            fn set_sorted(&mut self, reverse: bool) {
+            fn _set_sorted(&mut self, reverse: bool) {
+                #[cfg(debug_assertions)]
+                {
+                    match (self.cont_slice(), self.is_empty()) {
+                        (Ok(vals), false) => {
+                            if reverse {
+                                assert!(vals[0] >= vals[vals.len() - 1])
+                            } else {
+                                assert!(vals[0] <= vals[vals.len() - 1])
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 self.0.set_sorted(reverse)
             }
 
@@ -172,15 +141,15 @@ macro_rules! impl_dyn_series {
                 self.0.vec_hash_combine(build_hasher, hashes)
             }
 
-            fn agg_min(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_min(groups)
             }
 
-            fn agg_max(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_max(groups)
             }
 
-            fn agg_sum(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_sum(&self, groups: &GroupsProxy) -> Series {
                 use DataType::*;
                 match self.dtype() {
                     Int8 | UInt8 | Int16 | UInt16 => self.cast(&Int64).unwrap().agg_sum(groups),
@@ -188,19 +157,19 @@ macro_rules! impl_dyn_series {
                 }
             }
 
-            fn agg_std(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_std(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_std(groups)
             }
 
-            fn agg_var(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_var(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_var(groups)
             }
 
-            fn agg_list(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_list(groups)
             }
 
-            fn agg_quantile(
+            unsafe fn agg_quantile(
                 &self,
                 groups: &GroupsProxy,
                 quantile: f64,
@@ -209,7 +178,7 @@ macro_rules! impl_dyn_series {
                 self.0.agg_quantile(groups, quantile, interpol)
             }
 
-            fn agg_median(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_median(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_median(groups)
             }
             fn zip_outer_join_column(
@@ -259,7 +228,7 @@ macro_rules! impl_dyn_series {
             fn rolling_apply(
                 &self,
                 _f: &dyn Fn(&Series) -> Series,
-                _options: RollingOptions,
+                _options: RollingOptionsFixedWindow,
             ) -> Result<Series> {
                 ChunkRollApply::rolling_apply(&self.0, _f, _options).map(|ca| ca.into_series())
             }
@@ -317,157 +286,6 @@ macro_rules! impl_dyn_series {
                 self.0.shrink_to_fit()
             }
 
-            fn i8(&self) -> Result<&Int8Chunked> {
-                if matches!(self.0.dtype(), DataType::Int8) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Int8Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into i8",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            // For each column create a series
-            fn i16(&self) -> Result<&Int16Chunked> {
-                if matches!(self.0.dtype(), DataType::Int16) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Int16Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into i16",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn i32(&self) -> Result<&Int32Chunked> {
-                if matches!(self.0.dtype(), DataType::Int32) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Int32Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into i32",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn i64(&self) -> Result<&Int64Chunked> {
-                if matches!(self.0.dtype(), DataType::Int64) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Int64Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into i64",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn f32(&self) -> Result<&Float32Chunked> {
-                if matches!(self.0.dtype(), DataType::Float32) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Float32Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into f32",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn f64(&self) -> Result<&Float64Chunked> {
-                if matches!(self.0.dtype(), DataType::Float64) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Float64Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into f64",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn u8(&self) -> Result<&UInt8Chunked> {
-                if matches!(self.0.dtype(), DataType::UInt8) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const UInt8Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into u8",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn u16(&self) -> Result<&UInt16Chunked> {
-                if matches!(self.0.dtype(), DataType::UInt16) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const UInt16Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into u16",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn u32(&self) -> Result<&UInt32Chunked> {
-                if matches!(self.0.dtype(), DataType::UInt32) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const UInt32Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into u32",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            fn u64(&self) -> Result<&UInt64Chunked> {
-                if matches!(self.0.dtype(), DataType::UInt64) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const UInt64Chunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into u64",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
             fn append_array(&mut self, other: ArrayRef) -> Result<()> {
                 self.0.append_array(other)
             }
@@ -511,8 +329,8 @@ macro_rules! impl_dyn_series {
             }
 
             #[cfg(feature = "chunked_ids")]
-            unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-                self.0.take_chunked_unchecked(by).into_series()
+            unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+                self.0.take_chunked_unchecked(by, sorted).into_series()
             }
 
             #[cfg(feature = "chunked_ids")]
@@ -547,7 +365,11 @@ macro_rules! impl_dyn_series {
                 } else {
                     Cow::Borrowed(idx)
                 };
-                Ok(ChunkTake::take_unchecked(&self.0, (&*idx).into()).into_series())
+                let mut out = ChunkTake::take_unchecked(&self.0, (&*idx).into());
+                if self.0.is_sorted() && (idx.is_sorted() || idx.is_sorted_reverse()) {
+                    out.set_sorted(idx.is_sorted_reverse())
+                }
+                Ok(out.into_series())
             }
 
             unsafe fn take_opt_iter_unchecked(&self, iter: &mut dyn TakeIteratorNulls) -> Series {
@@ -684,20 +506,6 @@ macro_rules! impl_dyn_series {
             }
             fn clone_inner(&self) -> Arc<dyn SeriesTrait> {
                 Arc::new(SeriesWrap(Clone::clone(&self.0)))
-            }
-
-            fn pow(&self, exponent: f64) -> Result<Series> {
-                let f_err = || {
-                    Err(PolarsError::InvalidOperation(
-                        format!("power operation not supported on dtype {:?}", self.dtype()).into(),
-                    ))
-                };
-
-                match self.dtype() {
-                    DataType::Utf8 | DataType::List(_) | DataType::Boolean => f_err(),
-                    DataType::Float32 => Ok(self.0.pow_f32(exponent as f32).into_series()),
-                    _ => Ok(self.0.pow_f64(exponent).into_series()),
-                }
             }
 
             fn peak_max(&self) -> BooleanChunked {

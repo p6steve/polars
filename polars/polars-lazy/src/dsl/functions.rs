@@ -8,6 +8,8 @@ use polars_core::export::arrow::temporal_conversions::NANOSECONDS;
 use polars_core::prelude::*;
 use polars_core::utils::arrow::temporal_conversions::SECONDS_IN_DAY;
 use polars_core::utils::get_supertype;
+#[cfg(feature = "list")]
+use polars_ops::prelude::ListNameSpaceImpl;
 use rayon::prelude::*;
 use std::ops::{BitAnd, BitOr};
 
@@ -182,7 +184,8 @@ pub fn argsort_by<E: AsRef<[Expr]>>(by: E, reverse: &[bool]) -> Expr {
 #[cfg(feature = "concat_str")]
 #[cfg_attr(docsrs, doc(cfg(feature = "concat_str")))]
 /// Horizontally concat string columns in linear time
-pub fn concat_str(s: Vec<Expr>, sep: &str) -> Expr {
+pub fn concat_str<E: AsRef<[Expr]>>(s: E, sep: &str) -> Expr {
+    let s = s.as_ref().to_vec();
     let sep = sep.to_string();
     let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
         polars_core::functions::concat_str(s, &sep).map(|ca| ca.into_series())
@@ -203,7 +206,9 @@ pub fn concat_str(s: Vec<Expr>, sep: &str) -> Expr {
 /// Concat lists entries.
 #[cfg(feature = "list")]
 #[cfg_attr(docsrs, doc(cfg(feature = "list")))]
-pub fn concat_lst(s: Vec<Expr>) -> Expr {
+pub fn concat_lst<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(s: E) -> Expr {
+    let s = s.as_ref().iter().map(|e| e.clone().into()).collect();
+
     let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
         let mut first = std::mem::take(&mut s[0]);
         let other = &s[1..];
@@ -220,7 +225,23 @@ pub fn concat_lst(s: Vec<Expr>) -> Expr {
     Expr::AnonymousFunction {
         input: s,
         function,
-        output_type: GetOutput::map_dtype(|dt| DataType::List(Box::new(dt.clone()))),
+        output_type: GetOutput::map_dtypes(|dts| {
+            let mut super_type_inner = None;
+
+            for dt in dts {
+                match dt {
+                    DataType::List(inner) => match super_type_inner {
+                        None => super_type_inner = Some(*inner.clone()),
+                        Some(st_inner) => super_type_inner = get_supertype(&st_inner, inner).ok(),
+                    },
+                    dt => match super_type_inner {
+                        None => super_type_inner = Some((*dt).clone()),
+                        Some(st_inner) => super_type_inner = get_supertype(&st_inner, dt).ok(),
+                    },
+                }
+            }
+            DataType::List(Box::new(super_type_inner.unwrap()))
+        }),
         options: FunctionOptions {
             collect_groups: ApplyOptions::ApplyFlat,
             input_wildcard_expansion: true,
@@ -253,12 +274,13 @@ pub fn arange(low: Expr, high: Expr, step: usize) -> Expr {
                 .ok_or_else(|| PolarsError::NoData("no data in `high` evaluation".into()))?;
 
             if step > 1 {
-                Ok(
-                    Int64Chunked::from_iter_values("arange", (low..high).step_by(step))
-                        .into_series(),
-                )
+                let mut ca = Int64Chunked::from_iter_values("arange", (low..high).step_by(step));
+                ca.set_sorted(high < low);
+                Ok(ca.into_series())
             } else {
-                Ok(Int64Chunked::from_iter_values("arange", low..high).into_series())
+                let mut ca = Int64Chunked::from_iter_values("arange", low..high);
+                ca.set_sorted(high < low);
+                Ok(ca.into_series())
             }
         };
         apply_binary(
@@ -273,7 +295,7 @@ pub fn arange(low: Expr, high: Expr, step: usize) -> Expr {
             let sb = sb.cast(&DataType::Int64)?;
             let low = sa.i64()?;
             let high = sb.i64()?;
-            let mut builder = ListPrimitiveChunkedBuilder::<i64>::new(
+            let mut builder = ListPrimitiveChunkedBuilder::<Int64Type>::new(
                 "arange",
                 low.len(),
                 low.len() * 3,
@@ -521,7 +543,7 @@ pub fn concat<L: AsRef<[LazyFrame]>>(inputs: L, rechunk: bool) -> Result<LazyFra
     if rechunk {
         Ok(lf.map(
             |mut df: DataFrame| {
-                df.rechunk();
+                df.as_single_chunk_par();
                 Ok(df)
             },
             Some(AllowedOptimizations::default()),

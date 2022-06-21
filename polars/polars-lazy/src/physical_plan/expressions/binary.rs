@@ -1,5 +1,4 @@
 use crate::physical_plan::state::ExecutionState;
-use crate::physical_plan::PhysicalAggregation;
 use crate::prelude::*;
 use polars_core::frame::groupby::GroupsProxy;
 use polars_core::series::unstable::UnstableSeries;
@@ -30,7 +29,36 @@ impl BinaryExpr {
     }
 }
 
-pub(crate) fn apply_operator(left: &Series, right: &Series, op: Operator) -> Result<Series> {
+/// Can partially do operations in place.
+fn apply_operator_owned(left: Series, right: Series, op: Operator) -> Result<Series> {
+    match op {
+        Operator::Gt => ChunkCompare::<&Series>::gt(&left, &right).map(|ca| ca.into_series()),
+        Operator::GtEq => ChunkCompare::<&Series>::gt_eq(&left, &right).map(|ca| ca.into_series()),
+        Operator::Lt => ChunkCompare::<&Series>::lt(&left, &right).map(|ca| ca.into_series()),
+        Operator::LtEq => ChunkCompare::<&Series>::lt_eq(&left, &right).map(|ca| ca.into_series()),
+        Operator::Eq => ChunkCompare::<&Series>::equal(&left, &right).map(|ca| ca.into_series()),
+        Operator::NotEq => {
+            ChunkCompare::<&Series>::not_equal(&left, &right).map(|ca| ca.into_series())
+        }
+        Operator::Plus => Ok(left + right),
+        Operator::Minus => Ok(left - right),
+        Operator::Multiply => Ok(left * right),
+        Operator::Divide => Ok(&left / &right),
+        Operator::TrueDivide => {
+            use DataType::*;
+            match left.dtype() {
+                Date | Datetime(_, _) | Float32 | Float64 => Ok(&left / &right),
+                _ => Ok(&left.cast(&Float64)? / &right.cast(&Float64)?),
+            }
+        }
+        Operator::And => left.bitand(&right),
+        Operator::Or => left.bitor(&right),
+        Operator::Xor => left.bitxor(&right),
+        Operator::Modulus => Ok(&left % &right),
+    }
+}
+
+pub fn apply_operator(left: &Series, right: &Series, op: Operator) -> Result<Series> {
     match op {
         Operator::Gt => ChunkCompare::<&Series>::gt(left, right).map(|ca| ca.into_series()),
         Operator::GtEq => ChunkCompare::<&Series>::gt_eq(left, right).map(|ca| ca.into_series()),
@@ -70,7 +98,7 @@ impl PhysicalExpr for BinaryExpr {
                 || self.right.evaluate(df, state),
             )
         });
-        apply_operator(&lhs?, &rhs?, self.op)
+        apply_operator_owned(lhs?, rhs?, self.op)
     }
 
     #[allow(clippy::ptr_arg)]
@@ -120,7 +148,17 @@ impl PhysicalExpr for BinaryExpr {
                 | Operator::Modulus
                 | Operator::TrueDivide,
             ) => {
-                let out = apply_operator(lhs, rhs, self.op)?;
+                // we want to be able to mutate in place
+                // so we take the lhs to make sure that we drop
+                let lhs = lhs.clone();
+                let rhs = rhs.clone();
+
+                // drop lhs so that we might operate in place
+                {
+                    let _ = ac_l.take();
+                }
+
+                let out = apply_operator_owned(lhs, rhs, self.op)?;
 
                 ac_l.with_series(out, true);
                 Ok(ac_l)
@@ -131,12 +169,16 @@ impl PhysicalExpr for BinaryExpr {
             //
             (AggState::AggregatedFlat(_), AggState::Literal(_), _)
             | (AggState::Literal(_), AggState::AggregatedFlat(_), _) => {
-                let l = ac_l.series();
-                let r = ac_r.series();
-                let mut s = apply_operator(l, r, self.op)?;
-                s.rename(l.name());
+                let l = ac_l.series().clone();
+                let r = ac_r.series().clone();
 
-                ac_l.with_series(s, true);
+                // drop lhs so that we might operate in place
+                {
+                    let _ = ac_l.take();
+                }
+                let out = apply_operator_owned(l, r, self.op)?;
+
+                ac_l.with_series(out, true);
                 Ok(ac_l)
             }
             // One of the two exprs is aggregated with flat aggregation, e.g. `e.min(), e.max(), e.first()`
@@ -175,7 +217,7 @@ impl PhysicalExpr for BinaryExpr {
 
                                 // Safety:
                                 // we are in bounds
-                                let arr = unsafe { Arc::from(arr_l.slice_unchecked(idx, 1)) };
+                                let arr = unsafe { arr_l.slice_unchecked(idx, 1) };
                                 us.swap(arr);
 
                                 let l = us.as_ref();
@@ -225,7 +267,7 @@ impl PhysicalExpr for BinaryExpr {
                                 // TODO: optimize this? Its slow.
                                 // Safety:
                                 // we are in bounds
-                                let arr = unsafe { Arc::from(arr_r.slice_unchecked(idx, 1)) };
+                                let arr = unsafe { arr_r.slice_unchecked(idx, 1) };
                                 us.swap(arr);
                                 let r = us.as_ref();
 
@@ -253,11 +295,15 @@ impl PhysicalExpr for BinaryExpr {
                 ac_l.sort_by_groups();
                 ac_r.sort_by_groups();
 
-                let out = apply_operator(
-                    ac_l.flat_naive().as_ref(),
-                    ac_r.flat_naive().as_ref(),
-                    self.op,
-                )?;
+                let lhs = ac_l.flat_naive().as_ref().clone();
+                let rhs = ac_r.flat_naive().as_ref().clone();
+
+                // drop lhs so that we might operate in place
+                {
+                    let _ = ac_l.take();
+                }
+
+                let out = apply_operator_owned(lhs, rhs, self.op)?;
 
                 // we flattened the series, so that sorts by group
                 ac_l.with_update_groups(UpdateGroups::WithGroupsLen);
@@ -266,11 +312,15 @@ impl PhysicalExpr for BinaryExpr {
             }
             // flatten the Series and apply the operators
             (AggState::AggregatedList(_), AggState::AggregatedList(_), _) => {
-                let out = apply_operator(
-                    ac_l.flat_naive().as_ref(),
-                    ac_r.flat_naive().as_ref(),
-                    self.op,
-                )?;
+                let lhs = ac_l.flat_naive().as_ref().clone();
+                let rhs = ac_r.flat_naive().as_ref().clone();
+
+                // drop lhs so that we might operate in place
+                {
+                    let _ = ac_l.take();
+                }
+
+                let out = apply_operator_owned(lhs, rhs, self.op)?;
 
                 ac_l.combine_groups(ac_r).with_series(out, false);
                 ac_l.with_update_groups(UpdateGroups::WithGroupsLen);
@@ -286,16 +336,27 @@ impl PhysicalExpr for BinaryExpr {
                     let lhs = ac_l.aggregated();
                     ac_l.with_update_groups(UpdateGroups::WithSeriesLenOwned(lhs.clone()));
 
+                    // we should only explode lists
+                    // not aggregated flat states
+                    let flatten = |s: Series| match s.dtype() {
+                        DataType::List(_) => s.explode(),
+                        _ => Ok(s),
+                    };
+
                     let out =
-                        apply_operator(&lhs.explode()?, &ac_r.aggregated().explode()?, self.op)?;
+                        apply_operator(&flatten(lhs)?, &flatten(ac_r.aggregated())?, self.op)?;
                     ac_l.with_series(out, false);
                     Ok(ac_l)
                 } else {
-                    let out = apply_operator(
-                        ac_l.flat_naive().as_ref(),
-                        ac_r.flat_naive().as_ref(),
-                        self.op,
-                    )?;
+                    let lhs = ac_l.flat_naive().as_ref().clone();
+                    let rhs = ac_r.flat_naive().as_ref().clone();
+
+                    // drop lhs so that we might operate in place
+                    {
+                        let _ = ac_l.take();
+                    }
+
+                    let out = apply_operator_owned(lhs, rhs, self.op)?;
 
                     ac_l.combine_groups(ac_r).with_series(out, false);
 
@@ -309,16 +370,15 @@ impl PhysicalExpr for BinaryExpr {
         self.expr.to_field(input_schema, Context::Default)
     }
 
-    fn as_agg_expr(&self) -> Result<&dyn PhysicalAggregation> {
-        Ok(self)
+    fn as_partitioned_aggregator(&self) -> Option<&dyn PartitionedAggregation> {
+        Some(self)
     }
+
     #[cfg(feature = "parquet")]
     fn as_stats_evaluator(&self) -> Option<&dyn polars_io::predicates::StatsEvaluator> {
         Some(self)
     }
 }
-
-impl PhysicalAggregation for BinaryExpr {}
 
 #[cfg(feature = "parquet")]
 mod stats {
@@ -443,6 +503,8 @@ mod stats {
                     match l.to_min_max() {
                         None => Ok(true),
                         Some(min_max_s) => {
+                            // will be incorrect if not
+                            debug_assert_eq!(min_max_s.null_count(), 0);
                             let lit_s = self.right.evaluate(&dummy, &state).unwrap();
                             Ok(apply_operator_stats_rhs_lit(&min_max_s, &lit_s, self.op))
                         }
@@ -453,6 +515,8 @@ mod stats {
                     match r.to_min_max() {
                         None => Ok(true),
                         Some(min_max_s) => {
+                            // will be incorrect if not
+                            debug_assert_eq!(min_max_s.null_count(), 0);
                             let lit_s = self.left.evaluate(&dummy, &state).unwrap();
                             Ok(apply_operator_stats_lhs_lit(&lit_s, &min_max_s, self.op))
                         }
@@ -490,5 +554,29 @@ mod stats {
                 _ => self.impl_should_read(stats),
             }
         }
+    }
+}
+
+impl PartitionedAggregation for BinaryExpr {
+    fn evaluate_partitioned(
+        &self,
+        df: &DataFrame,
+        groups: &GroupsProxy,
+        state: &ExecutionState,
+    ) -> Result<Series> {
+        let left = self.left.as_partitioned_aggregator().unwrap();
+        let right = self.right.as_partitioned_aggregator().unwrap();
+        let left = left.evaluate_partitioned(df, groups, state)?;
+        let right = right.evaluate_partitioned(df, groups, state)?;
+        apply_operator(&left, &right, self.op)
+    }
+
+    fn finalize(
+        &self,
+        partitioned: Series,
+        _groups: &GroupsProxy,
+        _state: &ExecutionState,
+    ) -> Result<Series> {
+        Ok(partitioned)
     }
 }

@@ -9,12 +9,16 @@ mod groupby_rolling;
 mod join;
 mod melt;
 mod projection;
+#[cfg(feature = "python")]
+mod python_scan;
 mod scan;
 mod slice;
 mod sort;
 mod stack;
 mod udf;
 mod union;
+#[cfg(feature = "python")]
+pub(super) use self::python_scan::*;
 
 pub(super) use self::{
     cache::*, drop_duplicates::*, explode::*, filter::*, groupby::*, groupby_dynamic::*,
@@ -51,7 +55,7 @@ fn execute_projection_cached_window_fns(
     // the partitioning messes with column order, so we also store the idx
     // and use those to restore the original projection order
     #[allow(clippy::type_complexity)]
-    // String: partion_name,
+    // String: partition_name,
     // u32: index,
     // bool: flatten (we must run those first because they need a sorted group tuples.
     //       if we cache the group tuples we must ensure we cast the sorted onces.

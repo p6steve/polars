@@ -20,12 +20,13 @@ pub use arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit}
 use arrow::types::simd::Simd;
 use arrow::types::NativeType;
 use num::{Bounded, FromPrimitive, Num, NumCast, Zero};
+use polars_arrow::data_types::IsFloat;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
-use std::ops::{Add, AddAssign, Div, Mul, Rem, Sub};
+use std::ops::{Add, AddAssign, Div, Mul, Rem, Sub, SubAssign};
 
 pub struct Utf8Type {}
 
@@ -137,21 +138,44 @@ pub trait NumericNative:
     + Div<Output = Self>
     + Rem<Output = Self>
     + AddAssign
+    + SubAssign
     + Bounded
     + FromPrimitive
+    + IsFloat
     + NativeArithmetics
 {
+    type POLARSTYPE;
 }
-impl NumericNative for i8 {}
-impl NumericNative for i16 {}
-impl NumericNative for i32 {}
-impl NumericNative for i64 {}
-impl NumericNative for u8 {}
-impl NumericNative for u16 {}
-impl NumericNative for u32 {}
-impl NumericNative for u64 {}
-impl NumericNative for f32 {}
-impl NumericNative for f64 {}
+impl NumericNative for i8 {
+    type POLARSTYPE = Int8Type;
+}
+impl NumericNative for i16 {
+    type POLARSTYPE = Int16Type;
+}
+impl NumericNative for i32 {
+    type POLARSTYPE = Int32Type;
+}
+impl NumericNative for i64 {
+    type POLARSTYPE = Int64Type;
+}
+impl NumericNative for u8 {
+    type POLARSTYPE = UInt8Type;
+}
+impl NumericNative for u16 {
+    type POLARSTYPE = UInt16Type;
+}
+impl NumericNative for u32 {
+    type POLARSTYPE = UInt32Type;
+}
+impl NumericNative for u64 {
+    type POLARSTYPE = UInt64Type;
+}
+impl NumericNative for f32 {
+    type POLARSTYPE = Float32Type;
+}
+impl NumericNative for f64 {
+    type POLARSTYPE = Float64Type;
+}
 
 pub trait PolarsNumericType: Send + Sync + PolarsDataType + 'static {
     type Native: NumericNative;
@@ -389,18 +413,18 @@ impl<'a> AnyValue<'a> {
             dt => panic!("cannot create date from other type. dtype: {}", dt),
         }
     }
+    #[cfg(feature = "dtype-datetime")]
     pub(crate) fn into_datetime(self, tu: TimeUnit, tz: &'a Option<TimeZone>) -> Self {
         match self {
-            #[cfg(feature = "dtype-datetime")]
             AnyValue::Int64(v) => AnyValue::Datetime(v, tu, tz),
             AnyValue::Null => AnyValue::Null,
             dt => panic!("cannot create date from other type. dtype: {}", dt),
         }
     }
 
+    #[cfg(feature = "dtype-duration")]
     pub(crate) fn into_duration(self, tu: TimeUnit) -> Self {
         match self {
-            #[cfg(feature = "dtype-duration")]
             AnyValue::Int64(v) => AnyValue::Duration(v, tu),
             AnyValue::Null => AnyValue::Null,
             dt => panic!("cannot create date from other type. dtype: {}", dt),
@@ -504,49 +528,13 @@ impl Display for DataType {
             }
             DataType::Duration(tu) => return write!(f, "duration[{}]", tu),
             DataType::Time => "time",
-            DataType::List(tp) => return write!(f, "list [{}]", tp),
+            DataType::List(tp) => return write!(f, "list[{}]", tp),
             #[cfg(feature = "object")]
             DataType::Object(s) => s,
             #[cfg(feature = "dtype-categorical")]
             DataType::Categorical(_) => "cat",
             #[cfg(feature = "dtype-struct")]
-            DataType::Struct(fields) => {
-                return match fields.len() {
-                    1 => {
-                        write!(f, "struct{{{}: {}}}", fields[0].name(), fields[0].dtype)
-                    }
-                    2 => {
-                        write!(
-                            f,
-                            "struct[{}]{{'{}': {}, '{}': {}}}",
-                            fields.len(),
-                            fields[0].name(),
-                            fields[0].dtype,
-                            fields[1].name(),
-                            fields[1].dtype
-                        )
-                    }
-                    3 => {
-                        write!(
-                            f,
-                            "struct[{}]{{'{}', '{}', '{}'}}",
-                            fields.len(),
-                            fields[0].name(),
-                            fields[1].name(),
-                            fields[2].name()
-                        )
-                    }
-                    _ => {
-                        write!(
-                            f,
-                            "struct[{}]{{'{}',...,'{}'}}",
-                            fields.len(),
-                            fields[0].name(),
-                            fields[fields.len() - 1].name()
-                        )
-                    }
-                }
-            }
+            DataType::Struct(fields) => return write!(f, "struct[{}]", fields.len()),
             DataType::Unknown => unreachable!(),
         };
         f.write_str(s)
@@ -613,13 +601,17 @@ impl PartialOrd for AnyValue<'_> {
             (Int64(l), Int64(r)) => l.partial_cmp(r),
             (Float32(l), Float32(r)) => l.partial_cmp(r),
             (Float64(l), Float64(r)) => l.partial_cmp(r),
+            (Utf8(l), Utf8(r)) => l.partial_cmp(r),
             _ => None,
         }
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde-lazy", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    any(feature = "serde-lazy", feature = "serde"),
+    derive(Serialize, Deserialize)
+)]
 pub enum TimeUnit {
     Nanoseconds,
     Microseconds,
@@ -655,6 +647,15 @@ impl Display for TimeUnit {
 }
 
 impl TimeUnit {
+    pub fn to_ascii(self) -> &'static str {
+        use TimeUnit::*;
+        match self {
+            Nanoseconds => "ns",
+            Microseconds => "us",
+            Milliseconds => "ms",
+        }
+    }
+
     pub fn to_arrow(self) -> ArrowTimeUnit {
         match self {
             TimeUnit::Nanoseconds => ArrowTimeUnit::Nanosecond,
@@ -711,6 +712,12 @@ pub enum DataType {
     Unknown,
 }
 
+impl Default for DataType {
+    fn default() -> Self {
+        DataType::Unknown
+    }
+}
+
 impl Hash for DataType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state)
@@ -726,6 +733,11 @@ impl PartialEq for DataType {
                 #[cfg(feature = "dtype-categorical")]
                 (Categorical(_), Categorical(_)) => true,
                 (Datetime(tu_l, tz_l), Datetime(tu_r, tz_r)) => tu_l == tu_r && tz_l == tz_r,
+                (List(left_inner), List(right_inner)) => left_inner == right_inner,
+                #[cfg(feature = "dtype-duration")]
+                (Duration(tu_l), Duration(tu_r)) => tu_l == tu_r,
+                #[cfg(feature = "object")]
+                (Object(lhs), Object(rhs)) => lhs == rhs,
                 _ => std::mem::discriminant(self) == std::mem::discriminant(other),
             }
         }
@@ -735,6 +747,24 @@ impl PartialEq for DataType {
 impl Eq for DataType {}
 
 impl DataType {
+    pub fn value_within_range(&self, other: AnyValue) -> bool {
+        use DataType::*;
+        match self {
+            UInt8 => other.extract::<u8>().is_some(),
+            #[cfg(feature = "dtype-u16")]
+            UInt16 => other.extract::<u16>().is_some(),
+            UInt32 => other.extract::<u32>().is_some(),
+            UInt64 => other.extract::<u64>().is_some(),
+            #[cfg(feature = "dtype-i8")]
+            Int8 => other.extract::<i8>().is_some(),
+            #[cfg(feature = "dtype-i16")]
+            Int16 => other.extract::<i16>().is_some(),
+            Int32 => other.extract::<i32>().is_some(),
+            Int64 => other.extract::<i64>().is_some(),
+            _ => false,
+        }
+    }
+
     pub fn inner_dtype(&self) -> Option<&DataType> {
         if let DataType::List(inner) = self {
             Some(&*inner)
@@ -781,6 +811,21 @@ impl DataType {
             DataType::Categorical(_) => false,
             _ => true,
         }
+    }
+    pub fn is_signed(&self) -> bool {
+        // allow because it cannot be replaced when object feature is activated
+        #[allow(clippy::match_like_matches_macro)]
+        match self {
+            #[cfg(feature = "dtype-i8")]
+            DataType::Int8 => true,
+            #[cfg(feature = "dtype-i16")]
+            DataType::Int16 => true,
+            DataType::Int32 | DataType::Int64 => true,
+            _ => false,
+        }
+    }
+    pub fn is_unsigned(&self) -> bool {
+        self.is_numeric() && !self.is_signed()
     }
 
     /// Convert to an Arrow data type.
@@ -1017,6 +1062,8 @@ pub const IDX_DTYPE: DataType = DataType::UInt64;
 pub type IdxType = UInt32Type;
 #[cfg(feature = "bigidx")]
 pub type IdxType = UInt64Type;
+
+pub const NULL_DTYPE: DataType = DataType::Int32;
 
 #[cfg(test)]
 mod test {

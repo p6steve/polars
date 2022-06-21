@@ -4,7 +4,6 @@ pub(crate) use crate::frame::{groupby::aggregations::*, hash_join::*};
 pub(crate) use crate::utils::CustomIterTools;
 pub use crate::{
     chunked_array::{
-        arithmetic::Pow,
         builder::{
             BooleanChunkedBuilder, ChunkedBuilder, ListBooleanChunkedBuilder, ListBuilderTrait,
             ListPrimitiveChunkedBuilder, ListUtf8ChunkedBuilder, NewChunkedArray,
@@ -50,7 +49,7 @@ pub use crate::series::arithmetic::checked::NumOpsDispatchChecked;
 pub use crate::chunked_array::ops::unique::rank::{RankMethod, RankOptions};
 
 #[cfg(feature = "rolling_window")]
-pub use crate::chunked_array::ops::rolling_window::RollingOptions;
+pub use crate::chunked_array::ops::rolling_window::RollingOptionsFixedWindow;
 
 #[cfg(feature = "ewma")]
 pub use polars_arrow::kernels::ewm::EWMOptions;

@@ -47,3 +47,82 @@ fn test_filter_after_tail() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[cfg(feature = "unique_counts")]
+fn test_list_arithmetic_in_groupby() -> Result<()> {
+    // specifically make the amount of groups equal to df height.
+    let df = df![
+        "a" => ["foo", "ham", "bar"],
+        "b" => [1, 2, 3]
+    ]?;
+
+    let out = df
+        .lazy()
+        .groupby_stable([col("a")])
+        .agg([
+            col("b").list().alias("original"),
+            (col("b").list() * lit(2)).alias("mult_lit"),
+            (col("b").list() / lit(2)).alias("div_lit"),
+            (col("b").list() - lit(2)).alias("min_lit"),
+            (col("b").list() + lit(2)).alias("plus_lit"),
+            (col("b").list() % lit(2)).alias("mod_lit"),
+            (lit(1) + col("b").list()).alias("lit_plus"),
+            (col("b").unique_counts() + count()).alias("plus_count"),
+        ])
+        .collect()?;
+
+    let cols = ["mult_lit", "div_lit", "plus_count"];
+    let out = out.explode(&cols)?.select(&cols)?;
+
+    assert!(out.frame_equal(&df![
+        "mult_lit" => [2, 4, 6],
+        "div_lit"=> [0, 1, 1],
+        "plus_count" => [2 as IdxSize, 2, 2]
+    ]?));
+
+    Ok(())
+}
+
+#[test]
+fn test_filter_diff_arithmetic() -> Result<()> {
+    let df = df![
+        "user" => [1, 1, 1, 1, 2],
+        "group" => [1, 2, 1, 1, 2],
+        "value" => [1, 5, 14, 17, 20]
+    ]?;
+
+    let out = df
+        .lazy()
+        .groupby([col("user")])
+        .agg([(col("value")
+            .filter(col("group").eq(lit(1)))
+            .diff(1, Default::default())
+            * lit(2))
+        .alias("diff")])
+        .sort("user", Default::default())
+        .explode([col("diff")])
+        .collect()?;
+
+    let out = out.column("diff")?;
+    assert_eq!(out, &Series::new("diff", &[None, Some(26), Some(6), None]));
+
+    Ok(())
+}
+
+#[test]
+fn test_groupby_lit_agg() -> Result<()> {
+    let df = df![
+        "group" => [1, 2, 1, 1, 2],
+    ]?;
+
+    let out = df
+        .lazy()
+        .groupby([col("group")])
+        .agg([lit("foo").alias("foo")])
+        .collect()?;
+
+    assert_eq!(out.column("foo")?.dtype(), &DataType::Utf8);
+
+    Ok(())
+}

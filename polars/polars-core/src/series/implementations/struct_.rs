@@ -1,6 +1,7 @@
 use super::*;
 use crate::prelude::*;
 use crate::series::private::{PrivateSeries, PrivateSeriesNumeric};
+use std::any::Any;
 
 impl IntoSeries for StructChunked {
     fn into_series(self) -> Series {
@@ -45,14 +46,8 @@ impl private::PrivateSeries for SeriesWrap<StructChunked> {
         Ok(StructChunked::new_unchecked(self.0.name(), &fields).into_series())
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
-        let fields = self
-            .0
-            .fields()
-            .iter()
-            .map(|s| s.agg_list(groups))
-            .collect::<Vec<_>>();
-        StructChunked::new_unchecked(self.name(), &fields).into_series()
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+        self.0.agg_list(groups)
     }
 
     fn group_tuples(&self, multithreaded: bool, sorted: bool) -> GroupsProxy {
@@ -60,7 +55,7 @@ impl private::PrivateSeries for SeriesWrap<StructChunked> {
         let gb = df
             .groupby_with_series(self.0.fields().to_vec(), multithreaded, sorted)
             .unwrap();
-        gb.groups
+        gb.take_groups()
     }
 }
 
@@ -92,6 +87,11 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
         s.chunk_lengths()
     }
 
+    /// Underlying chunks.
+    fn chunks(&self) -> &Vec<ArrayRef> {
+        self.0.chunks()
+    }
+
     /// Number of chunks in this Series
     fn n_chunks(&self) -> usize {
         let s = self.0.fields().first().unwrap();
@@ -111,10 +111,17 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
     #[doc(hidden)]
     fn append(&mut self, other: &Series) -> Result<()> {
         let other = other.struct_()?;
+        let offset = self.chunks().len();
 
         for (lhs, rhs) in self.0.fields_mut().iter_mut().zip(other.fields()) {
+            let lhs_name = lhs.name();
+            let rhs_name = rhs.name();
+            if lhs_name != rhs_name {
+                return Err(PolarsError::SchemaMisMatch(format!("cannot append field with name: {rhs_name} to struct with field name: {lhs_name}, please check your schema").into()));
+            }
             lhs.append(rhs)?;
         }
+        self.0.update_chunks(offset);
         Ok(())
     }
 
@@ -123,8 +130,14 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
         let other = other.struct_()?;
 
         for (lhs, rhs) in self.0.fields_mut().iter_mut().zip(other.fields()) {
+            let lhs_name = lhs.name();
+            let rhs_name = rhs.name();
+            if lhs_name != rhs_name {
+                return Err(PolarsError::SchemaMisMatch(format!("cannot extend field with name: {rhs_name} to struct with field name: {lhs_name}, please check your schema").into()));
+            }
             lhs.extend(rhs)?;
         }
+        self.0.update_chunks(0);
         Ok(())
     }
 
@@ -146,9 +159,9 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
         self.0
-            .apply_fields(|s| s._take_chunked_unchecked(by))
+            .apply_fields(|s| s._take_chunked_unchecked(by, sorted))
             .into_series()
     }
 
@@ -213,7 +226,9 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
 
     /// Aggregate all chunks to a contiguous array of memory.
     fn rechunk(&self) -> Series {
-        self.0.apply_fields(|s| s.rechunk()).into_series()
+        let mut out = self.0.clone();
+        out.rechunk();
+        out.into_series()
     }
 
     fn expand_at_index(&self, index: usize, length: usize) -> Series {
@@ -272,7 +287,9 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
     /// Get unique values in the Series.
     fn unique(&self) -> Result<Series> {
         let groups = self.group_tuples(true, false);
-        Ok(self.0.clone().into_series().agg_first(&groups))
+        // safety:
+        // groups are in bounds
+        Ok(unsafe { self.0.clone().into_series().agg_first(&groups) })
     }
 
     /// Get unique values in the Series.
@@ -284,7 +301,7 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
     /// Get first indexes of unique values.
     fn arg_unique(&self) -> Result<IdxCa> {
         let groups = self.group_tuples(true, false);
-        let first = std::mem::take(groups.into_idx().first_mut());
+        let first = groups.take_group_firsts();
         Ok(IdxCa::from_vec(self.name(), first))
     }
 
@@ -300,6 +317,10 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
         is_not_null.reduce(|lhs, rhs| lhs.bitand(rhs)).unwrap()
     }
 
+    fn reverse(&self) -> Series {
+        self.0.apply_fields(|s| s.reverse()).into_series()
+    }
+
     fn shift(&self, periods: i64) -> Series {
         self.0.apply_fields(|s| s.shift(periods)).into_series()
     }
@@ -308,6 +329,11 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
         self.0
             .try_apply_fields(|s| s.fill_null(strategy))
             .map(|ca| ca.into_series())
+    }
+
+    #[cfg(feature = "is_in")]
+    fn is_in(&self, other: &Series) -> Result<BooleanChunked> {
+        self.0.is_in(other)
     }
 
     fn fmt_list(&self) -> String {

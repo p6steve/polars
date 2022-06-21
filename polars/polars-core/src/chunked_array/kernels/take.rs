@@ -47,10 +47,11 @@ pub(crate) unsafe fn take_list_unchecked(
     let taken = s
         .take_unchecked(&IdxCa::from_chunks(
             "",
-            vec![Arc::new(list_indices) as ArrayRef],
+            vec![Box::new(list_indices) as ArrayRef],
         ))
         .unwrap();
-    let taken = taken.chunks()[0].clone();
+
+    let taken = taken.array_ref(0).clone();
 
     let validity =
         // if null count > 0
@@ -74,5 +75,7 @@ pub(crate) unsafe fn take_list_unchecked(
         } else {
             None
         };
-    ListArray::from_data(values.data_type().clone(), offsets.into(), taken, validity)
+    // Safety:
+    // offsets are monotonically increasing
+    ListArray::new_unchecked(values.data_type().clone(), offsets.into(), taken, validity)
 }

@@ -67,7 +67,7 @@ impl DatetimeChunked {
             }
 
             let arr: Utf8Array<i64> = mutarr.into();
-            Arc::new(arr)
+            Box::new(arr)
         });
         ca.rename(self.name());
         ca
@@ -155,6 +155,10 @@ impl DatetimeChunked {
     /// Change the underlying [`TimeZone`]. This does not modify the data.
     pub fn set_time_zone(&mut self, tz: Option<TimeZone>) {
         self.2 = Some(Datetime(self.time_unit(), tz))
+    }
+    pub fn with_time_zone(mut self, tz: Option<TimeZone>) -> Self {
+        self.set_time_zone(tz);
+        self
     }
 }
 

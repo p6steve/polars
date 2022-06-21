@@ -37,7 +37,7 @@ impl Drop for ExtensionSentinel {
 }
 
 // https://stackoverflow.com/questions/28127165/how-to-convert-struct-to-u8d
-// not entirely sure if padding bytes in T are intialized or not.
+// not entirely sure if padding bytes in T are initialized or not.
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     std::slice::from_raw_parts((p as *const T) as *const u8, std::mem::size_of::<T>())
 }
@@ -191,7 +191,7 @@ mod test {
         let ca = ObjectChunked::new("", values);
 
         let groups = GroupsProxy::Idx(vec![(0, vec![0, 1]), (2, vec![2]), (3, vec![3])].into());
-        let out = ca.agg_list(&groups);
+        let out = unsafe { ca.agg_list(&groups) };
         assert!(matches!(out.dtype(), DataType::List(_)));
         assert_eq!(out.len(), groups.len());
     }
@@ -214,7 +214,7 @@ mod test {
         let ca = ObjectChunked::new("", values);
 
         let groups = vec![(0, vec![0, 1]), (2, vec![2]), (3, vec![3])].into();
-        let out = ca.agg_list(&GroupsProxy::Idx(groups));
+        let out = unsafe { ca.agg_list(&GroupsProxy::Idx(groups)) };
         let a = out.explode().unwrap();
 
         let ca_foo = a.as_any().downcast_ref::<ObjectChunked<Foo>>().unwrap();

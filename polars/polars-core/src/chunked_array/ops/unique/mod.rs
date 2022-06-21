@@ -52,11 +52,17 @@ pub(crate) fn is_unique_helper(
     duplicated_val: bool,
 ) -> BooleanChunked {
     debug_assert_ne!(unique_val, duplicated_val);
-    let idx = groups
-        .into_idx()
-        .into_iter()
-        .filter_map(|(first, g)| if g.len() == 1 { Some(first) } else { None })
-        .collect::<Vec<_>>();
+
+    let idx = match groups {
+        GroupsProxy::Idx(groups) => groups
+            .into_iter()
+            .filter_map(|(first, g)| if g.len() == 1 { Some(first) } else { None })
+            .collect::<Vec<_>>(),
+        GroupsProxy::Slice { groups, .. } => groups
+            .into_iter()
+            .filter_map(|[first, len]| if len == 1 { Some(first) } else { None })
+            .collect(),
+    };
     finish_is_unique_helper(idx, len, unique_val, duplicated_val)
 }
 
@@ -136,21 +142,16 @@ where
         .into_iter()
         .collect_trusted::<Vec<_>>();
     groups.sort_unstable_by_key(|k| k.1.len());
-    let first = &groups[0];
+    let last = &groups.last().unwrap();
 
-    let max_occur = first.1.len();
+    let max_occur = last.1.len();
 
     // collect until we don't take with trusted len anymore
     // TODO! take directly from iter, but first remove standard trusted-length collect.
-    let mut was_equal = true;
     let idx = groups
         .iter()
         .rev()
-        .take_while(|v| {
-            let current = was_equal;
-            was_equal = v.1.len() == max_occur;
-            current
-        })
+        .take_while(|v| v.1.len() == max_occur)
         .map(|v| v.0)
         .collect::<Vec<_>>();
     // Safety:
@@ -313,7 +314,7 @@ impl ChunkUnique<Float64Type> for Float64Chunked {
 mod is_first {
     use super::*;
     use crate::utils::CustomIterTools;
-    use arrow::array::{ArrayRef, BooleanArray};
+    use arrow::array::BooleanArray;
 
     fn is_first<T>(ca: &ChunkedArray<T>) -> BooleanChunked
     where
@@ -328,7 +329,7 @@ mod is_first {
                     .into_iter()
                     .map(|opt_v| unique.insert(opt_v))
                     .collect_trusted();
-                Arc::new(mask) as ArrayRef
+                Box::new(mask) as ArrayRef
             })
             .collect();
 
@@ -370,7 +371,7 @@ mod is_first {
                         .into_iter()
                         .map(|opt_v| unique.insert(opt_v))
                         .collect_trusted();
-                    Arc::new(mask) as ArrayRef
+                    Box::new(mask) as ArrayRef
                 })
                 .collect();
 
@@ -450,5 +451,23 @@ mod test {
                 Some(false)
             ]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "mode")]
+    fn mode() {
+        let ca = Int32Chunked::from_slice("a", &[0, 1, 2, 3, 4, 4, 5, 6, 5, 0]);
+        let mut result = Vec::from(&ca.mode().unwrap());
+        result.sort_by(|a, b| a.unwrap().cmp(&b.unwrap()));
+        assert_eq!(&result, &[Some(0), Some(4), Some(5)]);
+
+        let ca2 = Int32Chunked::from_slice("b", &[1, 1]);
+        let mut result2 = Vec::from(&ca2.mode().unwrap());
+        result2.sort_by(|a, b| a.unwrap().cmp(&b.unwrap()));
+        assert_eq!(&result2, &[Some(1)]);
+
+        let ca3 = Int32Chunked::from_slice("c", &[]);
+        let result3 = Vec::from(&ca3.mode().unwrap());
+        assert_eq!(result3, &[]);
     }
 }

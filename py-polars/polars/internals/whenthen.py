@@ -1,4 +1,4 @@
-from typing import Any, Union
+from typing import Any, Sequence, Union
 
 try:
     from polars.polars import when as pywhen
@@ -16,31 +16,65 @@ class WhenThenThen:
     """
 
     def __init__(self, pywhenthenthen: Any):
-        self.pywenthenthen = pywhenthenthen
+        self.pywhenthenthen = pywhenthenthen
 
     def when(self, predicate: pli.Expr) -> "WhenThenThen":
         """
         Start another when, then, otherwise layer.
         """
-        return WhenThenThen(self.pywenthenthen.when(predicate._pyexpr))
+        return WhenThenThen(self.pywhenthenthen.when(predicate._pyexpr))
 
-    def then(self, expr: Union[pli.Expr, int, float, str]) -> "WhenThenThen":
+    def then(
+        self,
+        expr: Union[
+            pli.Expr,
+            int,
+            float,
+            str,
+            None,
+            Sequence[
+                Union[
+                    int,
+                    float,
+                    str,
+                    None,
+                ]
+            ],
+        ],
+    ) -> "WhenThenThen":
         """
         Values to return in case of the predicate being `True`.
 
         See Also: the `when` function.
         """
         expr_ = pli.expr_to_lit_or_expr(expr)
-        return WhenThenThen(self.pywenthenthen.then(expr_._pyexpr))
+        return WhenThenThen(self.pywhenthenthen.then(expr_._pyexpr))
 
-    def otherwise(self, expr: Union[pli.Expr, int, float, str]) -> pli.Expr:
+    def otherwise(
+        self,
+        expr: Union[
+            pli.Expr,
+            int,
+            float,
+            str,
+            None,
+            Sequence[
+                Union[
+                    int,
+                    float,
+                    str,
+                    None,
+                ]
+            ],
+        ],
+    ) -> pli.Expr:
         """
         Values to return in case of the predicate being `False`.
 
         See Also: the `when` function.
         """
         expr = pli.expr_to_lit_or_expr(expr)
-        return pli.wrap_expr(self.pywenthenthen.otherwise(expr._pyexpr))
+        return pli.wrap_expr(self.pywhenthenthen.otherwise(expr._pyexpr))
 
 
 class WhenThen:
@@ -75,7 +109,12 @@ class When:
     def __init__(self, pywhen: "pywhen"):
         self._pywhen = pywhen
 
-    def then(self, expr: Union[pli.Expr, int, float, str]) -> WhenThen:
+    def then(
+        self,
+        expr: Union[
+            pli.Expr, int, float, str, None, Sequence[Union[None, int, float, str]]
+        ],
+    ) -> WhenThen:
         """
         Values to return in case of the predicate being `True`.
 

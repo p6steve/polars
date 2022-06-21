@@ -13,7 +13,8 @@ import polars as pl
 from polars import DataType
 
 
-def test_to_from_buffer(df: pl.DataFrame) -> None:
+def test_to_from_buffer(df_no_lists: pl.DataFrame) -> None:
+    df = df_no_lists
     buf = io.BytesIO()
     df.write_csv(buf)
     buf.seek(0)
@@ -26,7 +27,8 @@ def test_to_from_buffer(df: pl.DataFrame) -> None:
     assert df.frame_equal(read_df)
 
 
-def test_to_from_file(io_test_dir: str, df: pl.DataFrame) -> None:
+def test_to_from_file(io_test_dir: str, df_no_lists: pl.DataFrame) -> None:
+    df = df_no_lists
     df = df.drop("strings_nulls")
 
     f = os.path.join(io_test_dir, "small.csv")
@@ -412,3 +414,26 @@ def quoting_round_trip() -> None:
     read_df = pl.read_csv(f)
 
     assert read_df.frame_equal(df)
+
+
+def fallback_chrono_parser() -> None:
+    data = """date_1,date_2
+    2021-01-01,2021-1-1
+    2021-02-02,2021-2-2
+    2021-10-10,2021-10-10"""
+    assert pl.read_csv(data.encode(), parse_dates=True).null_count().row(0) == (0, 0)
+
+
+def test_csv_string_escaping() -> None:
+    df = pl.DataFrame({"a": ["Free trip to A,B", '''Special rate "1.79"''']})
+    f = io.BytesIO()
+    df.write_csv(f)
+    f.seek(0)
+    df_read = pl.read_csv(f)
+    assert df_read.frame_equal(df)
+
+
+def test_glob_csv(io_test_dir: str) -> None:
+    path = os.path.join(io_test_dir, "small*.csv")
+    assert pl.scan_csv(path).collect().shape == (3, 11)
+    assert pl.read_csv(path).shape == (3, 11)

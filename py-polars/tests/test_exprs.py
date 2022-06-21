@@ -173,7 +173,9 @@ def test_entropy() -> None:
     )
 
     assert (
-        df.groupby("group", maintain_order=True).agg(pl.col("id").entropy())
+        df.groupby("group", maintain_order=True).agg(
+            pl.col("id").entropy(normalize=True)
+        )
     ).frame_equal(
         pl.DataFrame(
             {"group": ["A", "B"], "id": [1.0397207708399179, 1.371381017771811]}
@@ -220,3 +222,43 @@ def test_null_count_expr() -> None:
     df = pl.DataFrame({"key": ["a", "b", "b", "a"], "val": [1, 2, None, 1]})
 
     assert df.select([pl.all().null_count()]).to_dict(False) == {"key": [0], "val": [1]}
+
+
+def test_power_by_expression() -> None:
+    assert pl.DataFrame(
+        {"a": [1, None, None, 4, 5, 6], "b": [1, 2, None, 4, None, 6]}
+    ).select([(pl.col("a") ** pl.col("b")).alias("pow")])["pow"].to_list() == [
+        1.0,
+        None,
+        None,
+        256.0,
+        None,
+        46656.0,
+    ]
+
+
+def test_expression_appends() -> None:
+    df = pl.DataFrame({"a": [1, 1, 2]})
+
+    assert df.select(pl.repeat(None, 3).append(pl.col("a"))).n_chunks() == 2
+
+    assert df.select(pl.repeat(None, 3).append(pl.col("a")).rechunk()).n_chunks() == 1
+
+    out = df.select(pl.concat([pl.repeat(None, 3), pl.col("a")]))
+
+    assert out.n_chunks() == 1
+    assert out.to_series().to_list() == [None, None, None, 1, 1, 2]
+
+
+def test_regex_in_filter() -> None:
+    df = pl.DataFrame(
+        {
+            "nrs": [1, 2, 3, None, 5],
+            "names": ["foo", "ham", "spam", "egg", None],
+            "flt": [1.0, None, 3.0, 1.0, None],
+        }
+    )
+
+    assert df.filter(
+        pl.fold(acc=False, f=lambda acc, s: acc | s, exprs=(pl.col("^nrs|flt*$") < 3))
+    ).row(0) == (1, "foo", 1.0)

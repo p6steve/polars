@@ -7,7 +7,8 @@ use crate::fmt::FmtList;
 use crate::frame::groupby::*;
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
-use arrow::array::ArrayRef;
+#[cfg(feature = "chunked_ids")]
+use crate::series::IsSorted;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use std::any::Any;
 use std::borrow::Cow;
@@ -29,7 +30,7 @@ impl private::PrivateSeries for SeriesWrap<ListChunked> {
         self.0.explode_by_offsets(offsets)
     }
 
-    fn set_sorted(&mut self, reverse: bool) {
+    fn _set_sorted(&mut self, reverse: bool) {
         self.0.set_sorted(reverse)
     }
 
@@ -42,7 +43,7 @@ impl private::PrivateSeries for SeriesWrap<ListChunked> {
         ChunkZip::zip_with(&self.0, mask, other.as_ref().as_ref()).map(|ca| ca.into_series())
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_list(groups)
     }
 
@@ -73,10 +74,6 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
     }
     fn shrink_to_fit(&mut self) {
         self.0.shrink_to_fit()
-    }
-
-    fn list(&self) -> Result<&ListChunked> {
-        unsafe { Ok(&*(self as *const dyn SeriesTrait as *const ListChunked)) }
     }
 
     fn append_array(&mut self, other: ArrayRef) -> Result<()> {
@@ -113,8 +110,8 @@ impl SeriesTrait for SeriesWrap<ListChunked> {
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-        self.0.take_chunked_unchecked(by).into_series()
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+        self.0.take_chunked_unchecked(by, sorted).into_series()
     }
 
     #[cfg(feature = "chunked_ids")]

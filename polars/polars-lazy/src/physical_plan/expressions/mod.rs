@@ -6,6 +6,7 @@ mod cast;
 mod column;
 mod count;
 mod filter;
+mod group_iter;
 mod is_not_null;
 mod is_null;
 mod literal;
@@ -16,17 +17,18 @@ mod sort;
 mod sortby;
 mod take;
 mod ternary;
-mod utils;
 mod window;
 
 pub(crate) use {
     aggregation::*, alias::*, apply::*, binary::*, cast::*, column::*, count::*, filter::*,
     is_not_null::*, is_null::*, literal::*, not::*, shift::*, slice::*, sort::*, sortby::*,
-    take::*, ternary::*, utils::*, window::*,
+    take::*, ternary::*, window::*,
 };
 
 use crate::physical_plan::state::ExecutionState;
 use crate::prelude::*;
+use polars_arrow::export::arrow::array::ListArray;
+use polars_arrow::trusted_len::PushUnchecked;
 use polars_arrow::utils::CustomIterTools;
 use polars_core::frame::groupby::GroupsProxy;
 use polars_core::prelude::*;
@@ -124,10 +126,13 @@ impl<'a> AggregationContext<'a> {
                                 out
                             })
                             .collect();
-                        self.groups = Cow::Owned(GroupsProxy::Slice(groups))
+                        self.groups = Cow::Owned(GroupsProxy::Slice {
+                            groups,
+                            rolling: false,
+                        })
                     }
                     // sliced groups are already in correct order
-                    GroupsProxy::Slice(_) => {}
+                    GroupsProxy::Slice { .. } => {}
                 }
                 self.update_groups = UpdateGroups::No;
             }
@@ -279,7 +284,10 @@ impl<'a> AggregationContext<'a> {
                         out
                     })
                     .collect_trusted();
-                self.groups = Cow::Owned(GroupsProxy::Slice(groups));
+                self.groups = Cow::Owned(GroupsProxy::Slice {
+                    groups,
+                    rolling: false,
+                });
             }
             _ => {
                 let groups = self
@@ -299,7 +307,10 @@ impl<'a> AggregationContext<'a> {
                         }
                     })
                     .collect_trusted();
-                self.groups = Cow::Owned(GroupsProxy::Slice(groups));
+                self.groups = Cow::Owned(GroupsProxy::Slice {
+                    groups,
+                    rolling: false,
+                });
             }
         }
         self.update_groups = UpdateGroups::No;
@@ -307,14 +318,18 @@ impl<'a> AggregationContext<'a> {
 
     /// In a binary expression one state can be aggregated and the other not.
     /// If both would be flattened naively one would be sorted and the other not.
-    /// Calling this function will ensure both are sortened. This will be a no-op
+    /// Calling this function will ensure both are sorted. This will be a no-op
     /// if already aggregated.
     pub(crate) fn sort_by_groups(&mut self) {
+        // make sure that the groups are updated before we use them to sort.
+        self.groups();
         match &self.state {
             AggState::NotAggregated(s) => {
                 // We should not aggregate literals!!
                 if self.state.safe_to_agg(&self.groups) {
-                    let agg = s.agg_list(&self.groups);
+                    // safety:
+                    // groups are in bounds
+                    let agg = unsafe { s.agg_list(&self.groups) };
                     self.update_groups = UpdateGroups::WithGroupsLen;
                     self.state = AggState::AggregatedList(agg);
                 }
@@ -381,7 +396,10 @@ impl<'a> AggregationContext<'a> {
                     }
                 }
 
-                let out = s.agg_list(&self.groups);
+                // safety:
+                // groups are in bounds
+                let out = unsafe { s.agg_list(&self.groups) };
+                self.state = AggState::AggregatedList(out.clone());
 
                 if !self.sorted {
                     self.sorted = true;
@@ -399,6 +417,21 @@ impl<'a> AggregationContext<'a> {
         }
     }
 
+    /// Get the final aggregated version of the series.
+    pub(crate) fn finalize(&mut self) -> Series {
+        // we clone, because we only want to call `self.groups()` if needed.
+        // self groups may instantiate new groups and thus can be expensive.
+        match &self.state {
+            AggState::Literal(s) => {
+                let s = s.clone();
+                self.groups();
+                let rows = self.groups.len();
+                s.expand_at_index(0, rows)
+            }
+            _ => self.aggregated(),
+        }
+    }
+
     /// Different from aggregated, in arity operations we expect literals to expand to the size of the
     /// group
     /// eg:
@@ -411,12 +444,46 @@ impl<'a> AggregationContext<'a> {
     /// this is because comparisons need to create mask that have a correct length.
     fn aggregated_arity_operation(&mut self) -> Series {
         if let AggState::Literal(s) = self.agg_state() {
+            // stop borrow;
             let s = s.clone();
-            // // todo! optimize this, we don't have to call agg_list, create the list directly.
-            let s = s.expand_at_index(0, self.groups.iter().map(|g| g.len()).sum());
-            s.agg_list(&self.groups)
+            let groups = self.groups();
+
+            let mut offsets = Vec::with_capacity(groups.len() + 1);
+
+            let mut last_offset = 0i64;
+            offsets.push(last_offset);
+            for g in groups.iter() {
+                last_offset += g.len() as i64;
+                // safety:
+                // we allocated enough
+                unsafe { offsets.push_unchecked(last_offset) };
+            }
+            let values = s.expand_at_index(0, last_offset as usize);
+            let values = values.array_ref(0).clone();
+            // Safety:
+            // offsets are monotonically increasing
+            let arr = unsafe {
+                ListArray::<i64>::new_unchecked(
+                    DataType::List(Box::new(s.dtype().clone())).to_arrow(),
+                    offsets.into(),
+                    values,
+                    None,
+                )
+            };
+            Series::try_from((s.name(), Box::new(arr) as ArrayRef)).unwrap()
         } else {
             self.aggregated()
+        }
+    }
+
+    // If a binary or ternary function has both of these branches true, it should
+    // flatten the list
+    fn arity_should_explode(&self) -> bool {
+        use AggState::*;
+        match self.agg_state() {
+            Literal(s) => s.len() == 1,
+            AggregatedFlat(_) => true,
+            _ => false,
         }
     }
 
@@ -486,16 +553,9 @@ pub trait PhysicalExpr: Send + Sync {
     /// Get the output field of this expr
     fn to_field(&self, input_schema: &Schema) -> Result<Field>;
 
-    /// Convert to a aggregation expression.
-    /// This can only be done for the final expressions that produce an aggregated result.
-    ///
-    /// The expression sum, min, max etc can be called as `evaluate` in the standard context,
-    /// or during a groupby execution, this method is called to convert them to an AggPhysicalExpr
-    fn as_agg_expr(&self) -> Result<&dyn PhysicalAggregation> {
-        let e = self.as_expression();
-        Err(PolarsError::InvalidOperation(
-            format!("{:?} is not an agg expression", e).into(),
-        ))
+    /// Convert to a partitioned aggregator.
+    fn as_partitioned_aggregator(&self) -> Option<&dyn PartitionedAggregation> {
+        None
     }
 
     /// Can take &dyn Statistics and determine of a file should be
@@ -525,21 +585,7 @@ impl PhysicalIoExpr for PhysicalIoHelper {
     }
 }
 
-pub trait PhysicalAggregation: Send + Sync + PhysicalExpr {
-    #[allow(clippy::ptr_arg)]
-    /// Should be called on the final aggregation node like sum, min, max, etc.
-    /// When called on a tail, slice, sort, etc. it should return a list-array
-    fn aggregate(
-        &self,
-        df: &DataFrame,
-        groups: &GroupsProxy,
-        state: &ExecutionState,
-    ) -> Result<Series> {
-        let mut ac = self.evaluate_on_groups(df, groups, state)?;
-        let s = ac.aggregated();
-        Ok(s)
-    }
-
+pub trait PartitionedAggregation: Send + Sync + PhysicalExpr {
     /// This is called in partitioned aggregation.
     /// Partitioned results may differ from aggregation results.
     /// For instance, for a `mean` operation a partitioned result
@@ -553,19 +599,14 @@ pub trait PhysicalAggregation: Send + Sync + PhysicalExpr {
         df: &DataFrame,
         groups: &GroupsProxy,
         state: &ExecutionState,
-    ) -> Result<Vec<Series>> {
-        // we return a vec, such that an implementor can return more information, such as a sum and count.
-        self.aggregate(df, groups, state).map(|s| vec![s])
-    }
+    ) -> Result<Series>;
 
     /// Called to merge all the partitioned results in a final aggregate.
     #[allow(clippy::ptr_arg)]
-    fn evaluate_partitioned_final(
+    fn finalize(
         &self,
-        final_df: &DataFrame,
+        partitioned: Series,
         groups: &GroupsProxy,
         state: &ExecutionState,
-    ) -> Result<Series> {
-        self.aggregate(final_df, groups, state)
-    }
+    ) -> Result<Series>;
 }

@@ -36,6 +36,7 @@ try:
 except ImportError:  # pragma: no cover
     _DOCUMENTING = True
 
+
 from polars import internals as pli
 from polars.datatypes import DataType, py_type_to_dtype
 from polars.utils import (
@@ -44,6 +45,13 @@ from polars.utils import (
     _process_null_values,
     format_path,
 )
+
+try:
+    import pyarrow as pa
+
+    _PYARROW_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PYARROW_AVAILABLE = False
 
 # Used to type any type or subclass of LazyFrame.
 # Used to indicate when LazyFrame methods return the same type as self,
@@ -177,10 +185,20 @@ class LazyFrame(Generic[DF]):
         rechunk: bool = True,
         row_count_name: Optional[str] = None,
         row_count_offset: int = 0,
+        storage_options: Optional[Dict] = None,
     ) -> LDF:
         """
         See Also: `pl.scan_parquet`
         """
+
+        # try fsspec scanner
+        if not pli._is_local_file(file):
+            scan = pli._scan_parquet_fsspec(file, storage_options)
+            if n_rows:
+                scan = scan.head(n_rows)
+            if row_count_name is not None:
+                scan = scan.with_row_count(row_count_name, row_count_offset)
+            return scan  # type: ignore
 
         self = cls.__new__(cls)
         self._ldf = PyLazyFrame.new_from_parquet(
@@ -196,16 +214,28 @@ class LazyFrame(Generic[DF]):
     @classmethod
     def scan_ipc(
         cls: Type[LDF],
-        file: str,
+        file: Union[str, Path],
         n_rows: Optional[int] = None,
         cache: bool = True,
         rechunk: bool = True,
         row_count_name: Optional[str] = None,
         row_count_offset: int = 0,
+        storage_options: Optional[Dict] = None,
     ) -> LDF:
         """
         See Also: `pl.scan_ipc`
         """
+        if isinstance(file, (str, Path)):
+            file = format_path(file)
+
+        # try fsspec scanner
+        if not pli._is_local_file(file):
+            scan = pli._scan_ipc_fsspec(file, storage_options)
+            if n_rows:
+                scan = scan.head(n_rows)
+            if row_count_name is not None:
+                scan = scan.with_row_count(row_count_name, row_count_offset)
+            return scan  # type: ignore
 
         self = cls.__new__(cls)
         self._ldf = PyLazyFrame.new_from_ipc(
@@ -299,6 +329,26 @@ class LazyFrame(Generic[DF]):
         else:
             self._ldf.to_json(file)
         return None
+
+    @classmethod
+    def _scan_python_function(
+        cls, schema: Union["pa.schema", Dict[str, Type[DataType]]], scan_fn: bytes
+    ) -> "LazyFrame":
+        self = cls.__new__(cls)
+        if isinstance(schema, dict):
+            self._ldf = PyLazyFrame.scan_from_python_function_pl_schema(
+                [(name, dt) for name, dt in schema.items()], scan_fn
+            )
+        else:
+            self._ldf = PyLazyFrame.scan_from_python_function_arrow_schema(
+                list(schema), scan_fn
+            )
+        return self
+
+    def __getitem__(self, item: Union[int, range, slice]) -> None:
+        raise TypeError(
+            "'LazyFrame' object is not subscriptable. Use 'select()' or 'filter()' instead."
+        )
 
     def pipe(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """
@@ -409,7 +459,7 @@ class LazyFrame(Generic[DF]):
         raw_output
             Return dot syntax. This cannot be combined with `show`
         figsize
-            Passed to matlotlib if `show` == True.
+            Passed to matplotlib if `show` == True.
         """
         if raw_output:
             show = False
@@ -610,7 +660,7 @@ class LazyFrame(Generic[DF]):
         no_optimization
             Turn off optimizations.
         slice_pushdown
-            Slice pushdown opitmizaiton
+            Slice pushdown optimization
 
         Returns
         -------
@@ -897,7 +947,7 @@ class LazyFrame(Generic[DF]):
             This column must be sorted in ascending order. If not the output will not make sense.
 
             In case of a rolling groupby on indices, dtype needs to be one of {Int32, Int64}. Note that
-            Int32 gets temporarely cast to Int64, so if performance matters use an Int64 column.
+            Int32 gets temporarily cast to Int64, so if performance matters use an Int64 column.
         period
             length of the window
         offset
@@ -1019,7 +1069,7 @@ class LazyFrame(Generic[DF]):
             This column must be sorted in ascending order. If not the output will not make sense.
 
             In case of a dynamic groupby on indices, dtype needs to be one of {Int32, Int64}. Note that
-            Int32 gets temporarely cast to Int64, so if performance matters use an Int64 column.
+            Int32 gets temporarily cast to Int64, so if performance matters use an Int64 column.
         every
             interval of the window
         period
@@ -1135,6 +1185,8 @@ class LazyFrame(Generic[DF]):
         force_parallel
             Force the physical plan to evaluate the computation of both DataFrames up to the join in parallel.
         """
+        if not isinstance(ldf, LazyFrame):
+            raise ValueError(f"Expected a `LazyFrame` as join table, got {type(ldf)}")
 
         if isinstance(on, str):
             left_on = on
@@ -1282,6 +1334,9 @@ class LazyFrame(Generic[DF]):
         └──────┴──────┴─────┴───────┘
 
         """
+        if not isinstance(ldf, LazyFrame):
+            raise ValueError(f"Expected a `LazyFrame` as join table, got {type(ldf)}")
+
         if how == "asof":
             warnings.warn(
                 "using asof join via LazyFrame.join is deprecated, please use LazyFrame.join_asof",
@@ -1375,7 +1430,10 @@ class LazyFrame(Generic[DF]):
             )
         )
 
-    def with_columns(self: LDF, exprs: Union[List["pli.Expr"], "pli.Expr"]) -> LDF:
+    def with_columns(
+        self: LDF,
+        exprs: Union["pli.Expr", "pli.Series", List[Union["pli.Expr", "pli.Series"]]],
+    ) -> LDF:
         """
         Add or overwrite multiple columns in a DataFrame.
 
@@ -1624,7 +1682,7 @@ class LazyFrame(Generic[DF]):
         """
         return self._from_pyldf(self._ldf.slice(offset, length))
 
-    def limit(self: LDF, n: int) -> LDF:
+    def limit(self: LDF, n: int = 5) -> LDF:
         """
         Limit the DataFrame to the first `n` rows. Note if you don't want the rows to be scanned,
         use the `fetch` operation.
@@ -1636,7 +1694,7 @@ class LazyFrame(Generic[DF]):
         """
         return self.slice(0, n)
 
-    def head(self: LDF, n: int) -> LDF:
+    def head(self: LDF, n: int = 5) -> LDF:
         """
         Gets the first `n` rows of the DataFrame. You probably don't want to use this!
 
@@ -1652,7 +1710,7 @@ class LazyFrame(Generic[DF]):
         """
         return self.limit(n)
 
-    def tail(self: LDF, n: int) -> LDF:
+    def tail(self: LDF, n: int = 5) -> LDF:
         """
         Get the last `n` rows of the DataFrame.
 

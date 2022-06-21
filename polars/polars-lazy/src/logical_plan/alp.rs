@@ -12,9 +12,21 @@ use polars_utils::arena::{Arena, Node};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-// ALogicalPlan is a representation of LogicalPlan with Nodes which are allocated in an Arena
+/// ALogicalPlan is a representation of LogicalPlan with Nodes which are allocated in an Arena
 #[derive(Clone, Debug)]
 pub enum ALogicalPlan {
+    AnonymousScan {
+        function: Arc<dyn AnonymousScan>,
+        schema: SchemaRef,
+        output_schema: Option<SchemaRef>,
+        predicate: Option<Node>,
+        aggregate: Vec<Node>,
+        options: AnonymousScanOptions,
+    },
+    #[cfg(feature = "python")]
+    PythonScan {
+        options: PythonOptions,
+    },
     Melt {
         input: Node,
         args: Arc<MeltArgs>,
@@ -143,6 +155,8 @@ impl ALogicalPlan {
     pub(crate) fn schema<'a>(&'a self, arena: &'a Arena<ALogicalPlan>) -> &'a SchemaRef {
         use ALogicalPlan::*;
         match self {
+            #[cfg(feature = "python")]
+            PythonScan { options } => &options.schema,
             Union { inputs, .. } => arena.get(inputs[0]).schema(arena),
             Cache { input } => arena.get(*input).schema(arena),
             Sort { input, .. } => arena.get(*input).schema(arena),
@@ -160,6 +174,11 @@ impl ALogicalPlan {
                 ..
             } => output_schema.as_ref().unwrap_or(schema),
             DataFrameScan { schema, .. } => schema,
+            AnonymousScan {
+                schema,
+                output_schema,
+                ..
+            } => output_schema.as_ref().unwrap_or(schema),
             Selection { input, .. } => arena.get(*input).schema(arena),
             #[cfg(feature = "csv-file")]
             CsvScan {
@@ -189,6 +208,10 @@ impl ALogicalPlan {
         use ALogicalPlan::*;
 
         match self {
+            #[cfg(feature = "python")]
+            PythonScan { options } => PythonScan {
+                options: options.clone(),
+            },
             Union { options, .. } => Union {
                 inputs,
                 options: *options,
@@ -361,6 +384,28 @@ impl ALogicalPlan {
                     selection: new_selection,
                 }
             }
+            AnonymousScan {
+                function,
+                schema,
+                output_schema,
+                predicate,
+                aggregate: _,
+                options,
+            } => {
+                let mut new_predicate = None;
+                if predicate.is_some() {
+                    new_predicate = exprs.pop()
+                }
+
+                AnonymousScan {
+                    function: function.clone(),
+                    schema: schema.clone(),
+                    aggregate: exprs,
+                    output_schema: output_schema.clone(),
+                    predicate: new_predicate,
+                    options: options.clone(),
+                }
+            }
             Udf {
                 function,
                 options,
@@ -446,6 +491,9 @@ impl ALogicalPlan {
                     container.push(*expr)
                 }
             }
+            #[cfg(feature = "python")]
+            PythonScan { .. } => {}
+            AnonymousScan { .. } => {}
         }
     }
 
@@ -499,6 +547,9 @@ impl ALogicalPlan {
             #[cfg(feature = "csv-file")]
             CsvScan { .. } => return,
             DataFrameScan { .. } => return,
+            AnonymousScan { .. } => return,
+            #[cfg(feature = "python")]
+            PythonScan { .. } => return,
         };
         container.push_node(input)
     }

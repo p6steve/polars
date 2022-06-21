@@ -99,7 +99,7 @@ impl DataFrame {
     /// as this is a lot slower than creating the `Series` in a columnar fashion
     #[cfg_attr(docsrs, doc(cfg(feature = "rows")))]
     pub fn from_rows(rows: &[Row]) -> Result<Self> {
-        let schema = rows_to_schema(rows);
+        let schema = rows_to_schema(rows, Some(50));
         let has_nulls = schema
             .iter_dtypes()
             .any(|dtype| matches!(dtype, DataType::Null));
@@ -187,7 +187,7 @@ pub fn infer_schema(
     infer_schema_length: usize,
 ) -> Schema {
     let mut values: Tracker = Tracker::new();
-    let len = iter.size_hint().1.unwrap();
+    let len = iter.size_hint().1.unwrap_or(infer_schema_length);
 
     let max_infer = std::cmp::min(len, infer_schema_length);
     for inner in iter.take(max_infer) {
@@ -223,7 +223,8 @@ fn resolve_fields(spec: Tracker) -> Vec<Field> {
         .collect()
 }
 
-fn coerce_data_type<A: Borrow<DataType>>(datatypes: &[A]) -> DataType {
+/// Coerces a slice of datatypes into a single supertype.
+pub fn coerce_data_type<A: Borrow<DataType>>(datatypes: &[A]) -> DataType {
     use DataType::*;
 
     let are_all_equal = datatypes.windows(2).all(|w| w[0].borrow() == w[1].borrow());
@@ -240,9 +241,9 @@ fn coerce_data_type<A: Borrow<DataType>>(datatypes: &[A]) -> DataType {
 }
 
 /// Infer schema from rows.
-pub fn rows_to_schema(rows: &[Row]) -> Schema {
+pub fn rows_to_schema(rows: &[Row], infer_schema_length: Option<usize>) -> Schema {
     // no of rows to use to infer dtype
-    let max_infer = std::cmp::min(rows.len(), 50);
+    let max_infer = infer_schema_length.unwrap_or(rows.len());
     let mut schema: Schema = (&rows[0]).into();
     // the first row that has no nulls will be used to infer the schema.
     // if there is a null, we check the next row and see if we can update the schema
@@ -302,7 +303,16 @@ impl<'a> From<&AnyValue<'a>> for DataType {
             StructOwned(payload) => DataType::Struct(payload.1.to_vec()),
             #[cfg(feature = "dtype-struct")]
             Struct(_, fields) => DataType::Struct(fields.to_vec()),
-            av => panic!("{:?} not implemented", av),
+            #[cfg(feature = "dtype-duration")]
+            Duration(_, tu) => DataType::Duration(*tu),
+            UInt8(_) => DataType::UInt8,
+            UInt16(_) => DataType::UInt16,
+            Int8(_) => DataType::Int8,
+            Int16(_) => DataType::Int16,
+            #[cfg(feature = "dtype-categorical")]
+            Categorical(_, rev_map) => DataType::Categorical(Some(Arc::new((*rev_map).clone()))),
+            #[cfg(feature = "object")]
+            Object(o) => DataType::Object(o.type_name()),
         }
     }
 }
@@ -337,6 +347,8 @@ pub(crate) enum AnyValueBuffer<'a> {
     Float32(PrimitiveChunkedBuilder<Float32Type>),
     Float64(PrimitiveChunkedBuilder<Float64Type>),
     Utf8(Utf8ChunkedBuilder),
+    #[cfg(feature = "dtype-categorical")]
+    Categorical(CategoricalChunkedBuilder),
     All(Vec<AnyValue<'a>>),
 }
 
@@ -381,7 +393,8 @@ impl<'a> AnyValueBuffer<'a> {
 
     pub(crate) fn add_fallible(&mut self, val: &AnyValue<'a>) -> Result<()> {
         self.add(val.clone()).ok_or_else(|| {
-            PolarsError::ComputeError(format!("Could not append {:?} to builder; make sure that all rows have the same schema.", val).into())
+            PolarsError::ComputeError(format!("Could not append {:?} to builder; make sure that all rows have the same schema.\n\
+            Or consider increasing the the 'schema_inference_length' argument.", val).into())
         })
     }
 
@@ -402,6 +415,8 @@ impl<'a> AnyValueBuffer<'a> {
             Float32(b) => b.finish().into_series(),
             Float64(b) => b.finish().into_series(),
             Utf8(b) => b.finish().into_series(),
+            #[cfg(feature = "dtype-categorical")]
+            Categorical(b) => b.finish().into_series(),
             All(vals) => Series::new("", vals),
         }
     }
@@ -429,6 +444,8 @@ impl From<(&DataType, usize)> for AnyValueBuffer<'_> {
             Float32 => AnyValueBuffer::Float32(PrimitiveChunkedBuilder::new("", len)),
             Float64 => AnyValueBuffer::Float64(PrimitiveChunkedBuilder::new("", len)),
             Utf8 => AnyValueBuffer::Utf8(Utf8ChunkedBuilder::new("", len, len * 5)),
+            #[cfg(feature = "dtype-categorical")]
+            Categorical(_) => AnyValueBuffer::Categorical(CategoricalChunkedBuilder::new("", len)),
             // Struct and List can be recursive so use anyvalues for that
             _ => AnyValueBuffer::All(Vec::with_capacity(len)),
         }
@@ -520,7 +537,7 @@ where
                     validity,
                 );
                 let name = format!("column_{}", i);
-                ChunkedArray::<T>::from_chunks(&name, vec![Arc::new(arr) as ArrayRef]).into_series()
+                ChunkedArray::<T>::from_chunks(&name, vec![Box::new(arr) as ArrayRef]).into_series()
             })
             .collect()
     });

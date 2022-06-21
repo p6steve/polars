@@ -61,8 +61,9 @@
 //! +-----+--------+-------+--------+
 //! ```
 //!
+use crate::mmap::{MmapBytesReader, ReaderBytes};
 use crate::prelude::*;
-use arrow::array::{ArrayRef, StructArray};
+use arrow::array::StructArray;
 use arrow::io::ndjson::read::FallibleStreamingIterator;
 pub use arrow::{
     error::Result as ArrowResult,
@@ -72,7 +73,8 @@ use polars_arrow::conversion::chunk_to_struct;
 use polars_arrow::kernels::concatenate::concatenate_owned_unchecked;
 use polars_core::prelude::*;
 use std::convert::TryFrom;
-use std::io::{BufRead, Seek, Write};
+use std::io::{Cursor, Seek, Write};
+use std::ops::Deref;
 
 pub enum JsonFormat {
     Json,
@@ -105,12 +107,12 @@ where
         }
     }
 
-    fn finish(mut self, df: &mut DataFrame) -> Result<()> {
+    fn finish(&mut self, df: &mut DataFrame) -> Result<()> {
         df.rechunk();
         let fields = df.iter().map(|s| s.field().to_arrow()).collect::<Vec<_>>();
         let batches = df
             .iter_chunks()
-            .map(|chunk| Ok(Arc::new(chunk_to_struct(chunk, fields.clone())) as ArrayRef));
+            .map(|chunk| Ok(Box::new(chunk_to_struct(chunk, fields.clone())) as ArrayRef));
 
         match self.json_format {
             JsonFormat::JsonLines => {
@@ -131,7 +133,7 @@ where
 #[must_use]
 pub struct JsonReader<R>
 where
-    R: BufRead + Seek,
+    R: MmapBytesReader,
 {
     reader: R,
     rechunk: bool,
@@ -144,7 +146,7 @@ where
 
 impl<R> SerReader<R> for JsonReader<R>
 where
-    R: BufRead + Seek,
+    R: MmapBytesReader,
 {
     fn new(reader: R) -> Self {
         JsonReader {
@@ -163,25 +165,30 @@ where
         self
     }
 
-    fn finish(mut self) -> Result<DataFrame> {
+    fn finish(self) -> Result<DataFrame> {
+        let mmap_read: ReaderBytes = (&self.reader).into();
+        let bytes = mmap_read.deref();
+
         let out = match self.json_format {
             JsonFormat::Json => {
-                let v = serde_json::from_reader(&mut self.reader)
-                    .map_err(|e| PolarsError::ComputeError(format!("{:?}", e).into()))?;
+                let json_value = arrow::io::json::read::json_deserializer::parse(bytes)
+                    .map_err(|err| PolarsError::ComputeError(format!("{:?}", err).into()))?;
                 // likely struct type
-                let dtype = json::read::infer(&v)?;
-                let arr = json::read::deserialize(&v, dtype)?;
+                let dtype = json::read::infer(&json_value)?;
+                let arr = json::read::deserialize(&json_value, dtype)?;
                 let arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
                     PolarsError::ComputeError("only can deserialize json objects".into())
                 })?;
                 DataFrame::try_from(arr.clone())
             }
             JsonFormat::JsonLines => {
-                let dtype = ndjson::read::infer(&mut self.reader, self.infer_schema_len)?;
-                self.reader.rewind()?;
+                let mut file = Cursor::new(bytes);
+
+                let dtype = ndjson::read::infer(&mut file, self.infer_schema_len)?;
+                file.rewind()?;
 
                 let mut reader = ndjson::read::FileReader::new(
-                    &mut self.reader,
+                    &mut file,
                     vec!["".to_string(); self.batch_size],
                     None,
                 );
@@ -210,7 +217,7 @@ where
 
 impl<R> JsonReader<R>
 where
-    R: BufRead + Seek,
+    R: MmapBytesReader,
 {
     /// Set the JSON file's schema
     pub fn with_schema(mut self, schema: &Schema) -> Self {

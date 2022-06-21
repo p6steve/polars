@@ -14,8 +14,7 @@ use crate::datatypes::*;
 pub struct StructChunked {
     fields: Vec<Series>,
     field: Field,
-    // needed by iterators
-    arrow_array: ArrayRef,
+    chunks: Vec<ArrayRef>,
 }
 
 fn fields_to_struct_array(fields: &[Series]) -> (ArrayRef, Vec<Series>) {
@@ -24,11 +23,20 @@ fn fields_to_struct_array(fields: &[Series]) -> (ArrayRef, Vec<Series>) {
     let new_fields = fields.iter().map(|s| s.field().to_arrow()).collect();
     let field_arrays = fields.iter().map(|s| s.to_arrow(0)).collect::<Vec<_>>();
     let arr = StructArray::new(ArrowDataType::Struct(new_fields), field_arrays, None);
-    (Arc::new(arr), fields)
+    (Box::new(arr), fields)
 }
 
 impl StructChunked {
     pub fn new(name: &str, fields: &[Series]) -> Result<Self> {
+        let mut names = PlHashSet::with_capacity(fields.len());
+        for s in fields {
+            let name = s.name();
+            if !names.insert(name) {
+                return Err(PolarsError::Duplicate(
+                    format!("multiple fields with name '{name}' found").into(),
+                ));
+            }
+        }
         if !fields.iter().map(|s| s.len()).all_equal() {
             Err(PolarsError::ShapeMisMatch(
                 "expected all fields to have equal length".into(),
@@ -39,7 +47,45 @@ impl StructChunked {
     }
 
     pub(crate) fn arrow_array(&self) -> &ArrayRef {
-        &self.arrow_array
+        &self.chunks[0]
+    }
+
+    pub(crate) fn chunks(&self) -> &Vec<ArrayRef> {
+        &self.chunks
+    }
+
+    pub fn rechunk(&mut self) {
+        self.fields = self.fields.iter().map(|s| s.rechunk()).collect();
+        self.update_chunks(0);
+    }
+
+    // Should be called after append or extend
+    pub(crate) fn update_chunks(&mut self, offset: usize) {
+        let new_fields = self
+            .fields
+            .iter()
+            .map(|s| s.field().to_arrow())
+            .collect::<Vec<_>>();
+        let n_chunks = self.fields[0].chunks().len();
+        for i in offset..n_chunks {
+            let field_arrays = self
+                .fields
+                .iter()
+                .map(|s| s.to_arrow(i))
+                .collect::<Vec<_>>();
+            let arr = Box::new(StructArray::new(
+                ArrowDataType::Struct(new_fields.clone()),
+                field_arrays,
+                None,
+            )) as ArrayRef;
+            match self.chunks.get_mut(i) {
+                Some(a) => *a = arr,
+                None => {
+                    self.chunks.push(arr);
+                }
+            }
+        }
+        self.chunks.truncate(n_chunks);
     }
 
     /// Does not check the lengths of the fields
@@ -56,7 +102,7 @@ impl StructChunked {
         Self {
             fields,
             field,
-            arrow_array,
+            chunks: vec![arrow_array],
         }
     }
 

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import List, Union
 
+import pyarrow as pa
 import pytest
 
 import polars as pl
@@ -85,8 +86,9 @@ def test_ipc_schema(compressions: List[str]) -> None:
 
 
 def test_ipc_schema_from_file(
-    io_test_dir: str, df: pl.DataFrame, compressions: List[str]
+    io_test_dir: str, df_no_lists: pl.DataFrame, compressions: List[str]
 ) -> None:
+    df = df_no_lists
     f_ipc = os.path.join(io_test_dir, "small.ipc")
 
     # does not yet work on windows because we hold an mmap?
@@ -108,3 +110,27 @@ def test_ipc_schema_from_file(
                     "time": pl.Time,
                     "cat": pl.Categorical,
                 }
+
+
+def test_ipc_column_order() -> None:
+    df = pl.DataFrame(
+        {
+            "cola": ["x", "y", "z"],
+            "colb": [1, 2, 3],
+            "colc": [4.5, 5.6, 6.7],
+        }
+    )
+    f = io.BytesIO()
+    df.write_ipc(f)
+    f.seek(0)
+
+    columns = ["colc", "colb", "cola"]
+    # read file into polars; the specified column order is no longer respected
+    assert pl.read_ipc(f, columns=columns).columns == columns
+
+
+def test_glob_ipc(io_test_dir: str) -> None:
+    if os.name != "nt":
+        path = os.path.join(io_test_dir, "small*.ipc")
+        assert pl.scan_ipc(path).collect().shape == (3, 12)
+        assert pl.read_ipc(path).shape == (3, 12)

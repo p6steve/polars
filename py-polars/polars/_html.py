@@ -5,7 +5,7 @@ from textwrap import dedent
 from types import TracebackType
 from typing import Dict, Iterable, List, Optional, Type
 
-from polars.datatypes import Object, dtype_to_ffiname
+from polars.datatypes import Object
 
 
 class Tag:
@@ -23,7 +23,7 @@ class Tag:
         if self.attributes is not None:
             s = f"<{self.tag} "
             for k, v in self.attributes.items():
-                s += f'{k}="{v} "'
+                s += f'{k}="{v}" '
             s += ">"
             self.elements.append(s)
         else:
@@ -67,6 +67,7 @@ class HTMLFormatter:
         """
         Writes the header of an HTML table.
         """
+        self.elements.append(f"<small>shape: {self.df.shape}</small>")
         with Tag(self.elements, "thead"):
             with Tag(self.elements, "tr"):
                 columns = self.df.columns
@@ -77,13 +78,13 @@ class HTMLFormatter:
                         else:
                             self.elements.append(columns[c])
             with Tag(self.elements, "tr"):
-                dtypes = self.df.dtypes
+                dtypes = self.df._df.dtype_strings()
                 for c in self.col_idx:
                     with Tag(self.elements, "td"):
                         if c == -1:
                             self.elements.append("...")
                         else:
-                            self.elements.append(dtype_to_ffiname(dtypes[c]))
+                            self.elements.append(dtypes[c])
 
     def write_body(self) -> None:
         """
@@ -139,8 +140,12 @@ class NotebookFormatter(HTMLFormatter):
         element_props = [
             ("tbody tr th:only-of-type", "vertical-align", "middle"),
             ("tbody tr th", "vertical-align", "top"),
+            ("thead th", "text-align", "right"),
+            ("td", "white-space", "pre"),
+            ("td", "line-height", "95%"),
+            ("td", "padding-top", "0"),
+            ("td", "padding-bottom", "0"),
         ]
-        element_props.append(("thead th", "text-align", "right"))
         template_mid = "\n\n".join(map(lambda t: template_select % t, element_props))
         template = dedent("\n".join((template_first, template_mid, template_last)))
         self.write(template)

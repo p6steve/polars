@@ -1,6 +1,7 @@
 use super::*;
 use polars_arrow::array::ValueSize;
 use polars_arrow::export::arrow::array::{MutableArray, MutableUtf8Array};
+use polars_ops::prelude::Utf8NameSpaceImpl;
 use polars_time::prelude::*;
 
 /// Specialized expressions for [`Series`] of [`DataType::Utf8`].
@@ -16,6 +17,79 @@ impl StringNameSpace {
         self.0
             .map(function, GetOutput::from_type(DataType::Utf8))
             .with_fmt("str.extract")
+    }
+
+    /// Return a copy of the string left filled with ASCII '0' digits to make a string of length width.
+    /// A leading sign prefix ('+'/'-') is handled by inserting the padding after the sign character
+    /// rather than before.
+    /// The original string is returned if width is less than or equal to `s.len()`.
+    #[cfg(feature = "string_justify")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "string_justify")))]
+    pub fn zfill(self, alignment: usize) -> Expr {
+        let function = move |s: Series| {
+            let ca = s.utf8()?;
+            Ok(ca.zfill(alignment).into_series())
+        };
+        self.0
+            .map(function, GetOutput::from_type(DataType::Utf8))
+            .with_fmt("str.zfill")
+    }
+
+    /// Return the string left justified in a string of length width.
+    /// Padding is done using the specified `fillchar`,
+    /// The original string is returned if width is less than or equal to `s.len()`.
+    #[cfg(feature = "string_justify")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "string_justify")))]
+    pub fn ljust(self, width: usize, fillchar: char) -> Expr {
+        let function = move |s: Series| {
+            let ca = s.utf8()?;
+            Ok(ca.ljust(width, fillchar).into_series())
+        };
+        self.0
+            .map(function, GetOutput::from_type(DataType::Utf8))
+            .with_fmt("str.ljust")
+    }
+
+    /// Return the string right justified in a string of length width.
+    /// Padding is done using the specified `fillchar`,
+    /// The original string is returned if width is less than or equal to `s.len()`.
+    #[cfg(feature = "string_justify")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "string_justify")))]
+    pub fn rjust(self, width: usize, fillchar: char) -> Expr {
+        let function = move |s: Series| {
+            let ca = s.utf8()?;
+            Ok(ca.rjust(width, fillchar).into_series())
+        };
+        self.0
+            .map(function, GetOutput::from_type(DataType::Utf8))
+            .with_fmt("str.rjust")
+    }
+
+    /// Extract each successive non-overlapping match in an individual string as an array
+    pub fn extract_all(self, pat: &str) -> Expr {
+        let pat = pat.to_string();
+        let function = move |s: Series| {
+            let ca = s.utf8()?;
+            ca.extract_all(&pat).map(|ca| ca.into_series())
+        };
+        self.0
+            .map(
+                function,
+                GetOutput::from_type(DataType::List(Box::new(DataType::Utf8))),
+            )
+            .with_fmt("str.extract_all")
+    }
+
+    /// Count all successive non-overlapping regex matches.
+    pub fn count_match(self, pat: &str) -> Expr {
+        let pat = pat.to_string();
+        let function = move |s: Series| {
+            let ca = s.utf8()?;
+            ca.count_match(&pat).map(|ca| ca.into_series())
+        };
+        self.0
+            .map(function, GetOutput::from_type(DataType::UInt32))
+            .with_fmt("str.extract_all")
     }
 
     #[cfg(feature = "temporal")]
@@ -38,6 +112,16 @@ impl StringNameSpace {
                     } else {
                         ca.as_datetime_not_exact(options.fmt.as_deref(), *tu)?
                             .into_series()
+                    }
+                }
+                DataType::Time => {
+                    if options.exact {
+                        ca.as_time(options.fmt.as_deref())?.into_series()
+                    } else {
+                        return Err(PolarsError::ComputeError(
+                            format!("non-exact not implemented for dtype {:?}", DataType::Time)
+                                .into(),
+                        ));
                     }
                 }
                 dt => {
@@ -145,8 +229,8 @@ impl StringNameSpace {
             let fields = arrs
                 .into_iter()
                 .enumerate()
-                .map(|(i, arr)| {
-                    Series::try_from((format!("field_{i}").as_str(), arr.into_arc())).unwrap()
+                .map(|(i, mut arr)| {
+                    Series::try_from((format!("field_{i}").as_str(), arr.as_box())).unwrap()
                 })
                 .collect::<Vec<_>>();
             Ok(StructChunked::new(ca.name(), &fields)?.into_series())
@@ -197,8 +281,8 @@ impl StringNameSpace {
             let fields = arrs
                 .into_iter()
                 .enumerate()
-                .map(|(i, arr)| {
-                    Series::try_from((format!("field_{i}").as_str(), arr.into_arc())).unwrap()
+                .map(|(i, mut arr)| {
+                    Series::try_from((format!("field_{i}").as_str(), arr.as_box())).unwrap()
                 })
                 .collect::<Vec<_>>();
             Ok(StructChunked::new(ca.name(), &fields)?.into_series())

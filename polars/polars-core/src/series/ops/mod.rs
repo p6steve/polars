@@ -1,13 +1,11 @@
 #[cfg(feature = "diff")]
 #[cfg_attr(docsrs, doc(cfg(feature = "diff")))]
 pub mod diff;
+mod downcast;
 #[cfg(feature = "ewma")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ewma")))]
 mod ewm;
 mod extend;
-#[cfg(feature = "log")]
-#[cfg_attr(docsrs, doc(cfg(feature = "log")))]
-mod log;
 #[cfg(feature = "moment")]
 #[cfg_attr(docsrs, doc(cfg(feature = "moment")))]
 pub mod moment;

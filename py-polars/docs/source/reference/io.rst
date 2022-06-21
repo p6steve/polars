@@ -31,6 +31,7 @@ Parquet
 
    read_parquet
    scan_parquet
+   read_parquet_schema
    DataFrame.write_parquet
 
 SQL
@@ -55,3 +56,19 @@ AVRO
 
    read_avro
    DataFrame.write_avro
+
+Excel
+~~~~~
+.. autosummary::
+   :toctree: api/
+
+   read_excel
+
+Datasets
+~~~~~~~~
+Connect to pyarrow datasets.
+
+.. autosummary::
+   :toctree: api/
+
+   scan_ds

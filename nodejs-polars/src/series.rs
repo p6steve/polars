@@ -548,6 +548,7 @@ impl JsSeries {
         &self,
         n: u32,
         with_replacement: bool,
+        shuffle: bool,
         seed: Option<Wrap<u64>>,
     ) -> napi::Result<Self> {
         // Safety:
@@ -555,7 +556,7 @@ impl JsSeries {
         let seed: Option<u64> = unsafe { std::mem::transmute(seed) };
         let s = self
             .series
-            .sample_n(n as usize, with_replacement, seed)
+            .sample_n(n as usize, with_replacement, shuffle, seed)
             .map_err(JsPolarsErr::from)?;
         Ok(s.into())
     }
@@ -565,6 +566,7 @@ impl JsSeries {
         &self,
         frac: f64,
         with_replacement: bool,
+        shuffle: bool,
         seed: Option<Wrap<u64>>,
     ) -> napi::Result<Self> {
         // Safety:
@@ -572,7 +574,7 @@ impl JsSeries {
         let seed: Option<u64> = unsafe { std::mem::transmute(seed) };
         let s = self
             .series
-            .sample_frac(frac, with_replacement, seed)
+            .sample_frac(frac, with_replacement, shuffle, seed)
             .map_err(JsPolarsErr::from)?;
         Ok(s.into())
     }
@@ -922,77 +924,6 @@ impl JsSeries {
         } else {
             None
         }
-    }
-
-    #[napi]
-    pub fn rolling_sum(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_sum(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_mean(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_mean(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_median(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_median(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_max(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_max(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_min(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_min(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_var(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_var(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_std(&self, options: JsRollingOptions) -> napi::Result<JsSeries> {
-        let s = self
-            .series
-            .rolling_std(options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
-    }
-    #[napi]
-    pub fn rolling_quantile(
-        &self,
-        quantile: f64,
-        interpolation: Wrap<QuantileInterpolOptions>,
-        options: JsRollingOptions,
-    ) -> napi::Result<JsSeries> {
-        let interpol = interpolation.0;
-        let s = self
-            .series
-            .rolling_quantile(quantile, interpol, options.into())
-            .map_err(JsPolarsErr::from)?;
-        Ok(s.into())
     }
     #[napi]
     pub fn year(&self) -> napi::Result<JsSeries> {

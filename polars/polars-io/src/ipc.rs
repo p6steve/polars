@@ -34,11 +34,14 @@
 //! ```
 use super::{finish_reader, ArrowReader, ArrowResult};
 use crate::predicates::PhysicalIoExpr;
-use crate::prelude::*;
+use crate::{prelude::*, WriterFactory};
 use arrow::io::ipc::write::WriteOptions;
 use arrow::io::ipc::{read, write};
 use polars_core::prelude::*;
+
 use std::io::{Read, Seek, Write};
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Read Arrows IPC format into a DataFrame
@@ -106,30 +109,31 @@ impl<R: Read + Seek> IpcReader<R> {
         self
     }
 
-    #[cfg(feature = "lazy")]
     // todo! hoist to lazy crate
+    #[cfg(feature = "lazy")]
     pub fn finish_with_scan_ops(
         mut self,
         predicate: Option<Arc<dyn PhysicalIoExpr>>,
         aggregate: Option<&[ScanAggregation]>,
-        projection: Option<&[usize]>,
+        projection: Option<Vec<usize>>,
     ) -> Result<DataFrame> {
         let rechunk = self.rechunk;
         let metadata = read::read_file_metadata(&mut self.reader)?;
-        let projection = projection.map(|x| {
-            let mut x = x.to_vec();
-            x.sort_unstable();
-            x
+
+        let sorted_projection = projection.clone().map(|mut proj| {
+            proj.sort_unstable();
+            proj
         });
 
-        let schema = if let Some(projection) = &projection {
+        let schema = if let Some(projection) = &sorted_projection {
             apply_projection(&metadata.schema, projection)
         } else {
             metadata.schema.clone()
         };
 
-        let reader = read::FileReader::new(&mut self.reader, metadata, projection);
+        let reader = read::FileReader::new(&mut self.reader, metadata, sorted_projection);
 
+        let include_row_count = self.row_count.is_some();
         finish_reader(
             reader,
             rechunk,
@@ -139,6 +143,7 @@ impl<R: Read + Seek> IpcReader<R> {
             &schema,
             self.row_count,
         )
+        .map(|df| fix_column_order(df, projection, include_row_count))
     }
 }
 
@@ -177,20 +182,24 @@ where
         let schema = &metadata.schema;
 
         if let Some(columns) = self.columns {
-            let mut prj = columns_to_projection(columns, schema)?;
-
-            // Ipc reader panics if the projection is not in increasing order, so sorting is the safer way.
-            prj.sort_unstable();
+            let prj = columns_to_projection(columns, schema)?;
             self.projection = Some(prj);
         }
 
-        let schema = if let Some(projection) = &self.projection {
+        let sorted_projection = self.projection.clone().map(|mut proj| {
+            proj.sort_unstable();
+            proj
+        });
+
+        let schema = if let Some(projection) = &sorted_projection {
             apply_projection(&metadata.schema, projection)
         } else {
             metadata.schema.clone()
         };
 
-        let ipc_reader = read::FileReader::new(&mut self.reader, metadata, self.projection);
+        let include_row_count = self.row_count.is_some();
+        let ipc_reader =
+            read::FileReader::new(&mut self.reader, metadata.clone(), sorted_projection);
         finish_reader(
             ipc_reader,
             rechunk,
@@ -200,6 +209,31 @@ where
             &schema,
             self.row_count,
         )
+        .map(|df| fix_column_order(df, self.projection, include_row_count))
+    }
+}
+
+fn fix_column_order(df: DataFrame, projection: Option<Vec<usize>>, row_count: bool) -> DataFrame {
+    if let Some(proj) = projection {
+        let offset = if row_count { 1 } else { 0 };
+        let mut args = (0..proj.len()).zip(proj).collect::<Vec<_>>();
+        // first el of tuple is argument index
+        // second el is the projection index
+        args.sort_unstable_by_key(|tpl| tpl.1);
+        let cols = df.get_columns();
+
+        let iter = args.iter().map(|tpl| cols[tpl.0 + offset].clone());
+        let cols = if row_count {
+            let mut new_cols = vec![df.get_columns()[0].clone()];
+            new_cols.extend(iter);
+            new_cols
+        } else {
+            iter.collect()
+        };
+
+        DataFrame::new_no_checks(cols)
+    } else {
+        df
     }
 }
 
@@ -232,10 +266,7 @@ use crate::RowCount;
 use polars_core::frame::ArrowChunk;
 pub use write::Compression as IpcCompression;
 
-impl<W> IpcWriter<W>
-where
-    W: Write,
-{
+impl<W> IpcWriter<W> {
     /// Set the compression used. Defaults to None.
     pub fn with_compression(mut self, compression: Option<write::Compression>) -> Self {
         self.compression = compression;
@@ -254,7 +285,7 @@ where
         }
     }
 
-    fn finish(mut self, df: &mut DataFrame) -> Result<()> {
+    fn finish(&mut self, df: &mut DataFrame) -> Result<()> {
         let mut ipc_writer = write::FileWriter::try_new(
             &mut self.writer,
             &df.schema().to_arrow(),
@@ -271,6 +302,48 @@ where
         }
         let _ = ipc_writer.finish()?;
         Ok(())
+    }
+}
+
+pub struct IpcWriterOption {
+    compression: Option<write::Compression>,
+    extension: PathBuf,
+}
+
+impl IpcWriterOption {
+    pub fn new() -> Self {
+        Self {
+            compression: None,
+            extension: PathBuf::from(".ipc"),
+        }
+    }
+
+    /// Set the compression used. Defaults to None.
+    pub fn with_compression(mut self, compression: Option<write::Compression>) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Set the extension. Defaults to ".ipc".
+    pub fn with_extension(mut self, extension: PathBuf) -> Self {
+        self.extension = extension;
+        self
+    }
+}
+
+impl Default for IpcWriterOption {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WriterFactory for IpcWriterOption {
+    fn create_writer<W: Write + 'static>(&self, writer: W) -> Box<dyn SerWriter<W>> {
+        Box::new(IpcWriter::new(writer).with_compression(self.compression))
+    }
+
+    fn extension(&self) -> PathBuf {
+        self.extension.to_owned()
     }
 }
 
@@ -333,7 +406,36 @@ mod test {
             .with_columns(Some(vec!["c".to_string(), "b".to_string()]))
             .finish()
             .unwrap();
-        assert_eq!(df_read.shape(), (3, 2));
+        df_read.frame_equal(&expected);
+
+        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        let mut df = df![
+            "a" => ["x", "y", "z"],
+            "b" => [123, 456, 789],
+            "c" => [4.5, 10.0, 10.0],
+            "d" => ["misc", "other", "value"],
+        ]
+        .unwrap();
+        IpcWriter::new(&mut buf)
+            .finish(&mut df)
+            .expect("ipc writer");
+        buf.set_position(0);
+        let expected = df![
+            "a" => ["x", "y", "z"],
+            "c" => [4.5, 10.0, 10.0],
+            "d" => ["misc", "other", "value"],
+            "b" => [123, 456, 789],
+        ]
+        .unwrap();
+        let df_read = IpcReader::new(buf)
+            .with_columns(Some(vec![
+                "a".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "b".to_string(),
+            ]))
+            .finish()
+            .unwrap();
         df_read.frame_equal(&expected);
     }
 

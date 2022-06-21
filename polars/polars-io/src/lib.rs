@@ -21,6 +21,10 @@ pub mod ipc;
 #[cfg(feature = "json")]
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub mod json;
+#[cfg(feature = "json")]
+#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+pub mod ndjson_core;
+
 #[cfg(any(feature = "csv-file", feature = "parquet"))]
 pub mod mmap;
 mod options;
@@ -36,6 +40,9 @@ pub mod prelude;
 mod tests;
 pub(crate) mod utils;
 
+#[cfg(feature = "partition")]
+pub mod partition;
+
 pub use options::*;
 
 #[cfg(any(feature = "ipc", feature = "json", feature = "avro"))]
@@ -48,6 +55,7 @@ use arrow::error::Result as ArrowResult;
 use polars_core::frame::ArrowChunk;
 use polars_core::prelude::*;
 use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
 
 pub trait SerReader<R>
 where
@@ -59,7 +67,7 @@ where
     #[must_use]
     fn set_rechunk(self, _rechunk: bool) -> Self
     where
-        Self: std::marker::Sized,
+        Self: Sized,
     {
         self
     }
@@ -72,8 +80,15 @@ pub trait SerWriter<W>
 where
     W: Write,
 {
-    fn new(writer: W) -> Self;
-    fn finish(self, df: &mut DataFrame) -> Result<()>;
+    fn new(writer: W) -> Self
+    where
+        Self: Sized;
+    fn finish(&mut self, df: &mut DataFrame) -> Result<()>;
+}
+
+pub trait WriterFactory {
+    fn create_writer<W: Write + 'static>(&self, writer: W) -> Box<dyn SerWriter<W>>;
+    fn extension(&self) -> PathBuf;
 }
 
 pub trait ArrowReader {
@@ -112,13 +127,20 @@ pub(crate) fn finish_reader<R: ArrowReader>(
 
         apply_aggregations(&mut df, aggregate)?;
 
-        parsed_dfs.push(df);
-
         if let Some(n) = n_rows {
             if num_rows >= n {
+                let len = n - parsed_dfs
+                    .iter()
+                    .map(|df: &DataFrame| df.height())
+                    .sum::<usize>();
+                if std::env::var("POLARS_VERBOSE").is_ok() {
+                    eprintln!("sliced off {} rows of the 'DataFrame'. These lines were read because they were in a single chunk.", df.height() - n)
+                }
+                parsed_dfs.push(df.slice(0, len));
                 break;
             }
         }
+        parsed_dfs.push(df);
     }
 
     let df = {
@@ -128,10 +150,7 @@ pub(crate) fn finish_reader<R: ArrowReader>(
                 .fields
                 .iter()
                 .map(|fld| {
-                    Series::try_from((
-                        fld.name.as_str(),
-                        Arc::from(new_empty_array(fld.data_type.clone())),
-                    ))
+                    Series::try_from((fld.name.as_str(), new_empty_array(fld.data_type.clone())))
                 })
                 .collect::<Result<_>>()?;
             DataFrame::new(empty_cols)?

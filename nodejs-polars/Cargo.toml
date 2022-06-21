@@ -1,6 +1,6 @@
 [package]
 name = "nodejs-polars"
-version = "0.5.2"
+version = "0.5.4"
 authors = ["Cory Grinstead"]
 documentation = "https://pola-rs.github.io/polars-book/"
 edition = "2021"
@@ -24,6 +24,7 @@ serde_json = { version = "1" }
 
 [dependencies.polars]
 features = [
+  "rolling_window",
   "json",
   "dynamic_groupby",
   "zip_with",

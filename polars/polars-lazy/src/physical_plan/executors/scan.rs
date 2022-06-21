@@ -36,7 +36,7 @@ type Predicate = Option<Arc<dyn PhysicalIoExpr>>;
 fn prepare_scan_args<'a>(
     path: &Path,
     predicate: &Option<Arc<dyn PhysicalExpr>>,
-    with_columns: &mut Option<Vec<String>>,
+    with_columns: &mut Option<Arc<Vec<String>>>,
     schema: &mut SchemaRef,
     n_rows: Option<usize>,
     aggregate: &'a [ScanAggregation],
@@ -93,11 +93,8 @@ impl Executor for IpcExec {
         let df = IpcReader::new(file)
             .with_n_rows(n_rows)
             .with_row_count(std::mem::take(&mut self.options.row_count))
-            .finish_with_scan_ops(
-                predicate,
-                aggregate,
-                projection.as_ref().map(|v| v.as_ref()),
-            )?;
+            .set_rechunk(self.options.rechunk)
+            .finish_with_scan_ops(predicate, aggregate, projection)?;
 
         if self.options.cache {
             state.store_cache(cache_key, df.clone())
@@ -158,6 +155,7 @@ impl Executor for ParquetExec {
             .with_n_rows(n_rows)
             .read_parallel(self.options.parallel)
             .with_row_count(std::mem::take(&mut self.options.row_count))
+            .set_rechunk(self.options.rechunk)
             .finish_with_scan_ops(
                 predicate,
                 aggregate,
@@ -224,7 +222,7 @@ impl Executor for CsvExec {
             .with_ignore_parser_errors(self.options.ignore_errors)
             .with_skip_rows(self.options.skip_rows)
             .with_n_rows(n_rows)
-            .with_columns(with_columns)
+            .with_columns(with_columns.map(|mut cols| std::mem::take(Arc::make_mut(&mut cols))))
             .low_memory(self.options.low_memory)
             .with_null_values(std::mem::take(&mut self.options.null_values))
             .with_predicate(predicate)
@@ -283,5 +281,25 @@ impl Executor for DataFrameExec {
         } else {
             Ok(df)
         }
+    }
+}
+
+pub(crate) struct AnonymousScanExec {
+    pub(crate) function: Arc<dyn AnonymousScan>,
+    pub(crate) options: AnonymousScanOptions,
+    pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+}
+
+impl Executor for AnonymousScanExec {
+    fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
+        let mut df = self.function.scan(self.options.clone())?;
+        if let Some(predicate) = &self.predicate {
+            let s = predicate.evaluate(&df, state)?;
+            let mask = s.bool().map_err(|_| {
+                PolarsError::ComputeError("filter predicate was not of type boolean".into())
+            })?;
+            df = df.filter(mask)?;
+        }
+        Ok(df)
     }
 }

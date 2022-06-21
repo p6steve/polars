@@ -136,11 +136,37 @@ pub fn split_series(s: &Series, n: usize) -> Result<Vec<Series>> {
     split_array!(s, n, i64)
 }
 
+fn flatten_df(df: &DataFrame) -> impl Iterator<Item = DataFrame> + '_ {
+    df.iter_chunks().map(|chunk| {
+        DataFrame::new_no_checks(
+            df.iter()
+                .zip(chunk.into_arrays())
+                .map(|(s, arr)| {
+                    // Safety:
+                    // datatypes are correct
+                    unsafe {
+                        Series::from_chunks_and_dtype_unchecked(s.name(), vec![arr], s.dtype())
+                    }
+                })
+                .collect(),
+        )
+    })
+}
+
 #[cfg(feature = "private")]
 #[doc(hidden)]
 pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
     let total_len = df.height();
     let chunk_size = total_len / n;
+
+    if df.n_chunks()? == n
+        && df.get_columns()[0]
+            .chunk_lengths()
+            .all(|len| len.abs_diff(chunk_size) < 100)
+    {
+        return Ok(flatten_df(df).collect());
+    }
+
     let mut out = Vec::with_capacity(n);
 
     for i in 0..n {
@@ -152,25 +178,9 @@ pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
         };
         let df = df.slice((i * chunk_size) as i64, len);
         if df.n_chunks()? > 1 {
-            let iter = df.iter_chunks().map(|chunk| {
-                DataFrame::new_no_checks(
-                    df.iter()
-                        .zip(chunk.into_arrays())
-                        .map(|(s, arr)| {
-                            // Safety:
-                            // datatypes are correct
-                            unsafe {
-                                Series::from_chunks_and_dtype_unchecked(
-                                    s.name(),
-                                    vec![arr],
-                                    s.dtype(),
-                                )
-                            }
-                        })
-                        .collect(),
-                )
-            });
-            out.extend(iter)
+            // we add every chunk as separate dataframe. This make sure that every partition
+            // deals with it.
+            out.extend(flatten_df(&df))
         } else {
             out.push(df)
         }
@@ -340,12 +350,10 @@ macro_rules! apply_method_all_arrow_series {
     }
 }
 
-// doesn't include Bool and Utf8
 #[macro_export]
-macro_rules! apply_method_numeric_series {
-    ($self:ident, $method:ident, $($args:expr),*) => {
+macro_rules! apply_method_physical_integer {
+    ($self:expr, $method:ident, $($args:expr),*) => {
         match $self.dtype() {
-
             #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $self.u8().unwrap().$method($($args),*),
             #[cfg(feature = "dtype-u16")]
@@ -358,55 +366,21 @@ macro_rules! apply_method_numeric_series {
             DataType::Int16 => $self.i16().unwrap().$method($($args),*),
             DataType::Int32 => $self.i32().unwrap().$method($($args),*),
             DataType::Int64 => $self.i64().unwrap().$method($($args),*),
-            DataType::Float32 => $self.f32().unwrap().$method($($args),*),
-            DataType::Float64 => $self.f64().unwrap().$method($($args),*),
-            #[cfg(feature = "dtype-date")]
-            DataType::Date => $self.date().unwrap().$method($($args),*),
-            #[cfg(feature = "dtype-datetime")]
-            DataType::Datetime(_, _) => $self.datetime().unwrap().$method($($args),*),
             _ => unimplemented!(),
         }
     }
 }
 
+// doesn't include Bool and Utf8
 #[macro_export]
-macro_rules! static_zip {
-    ($selected_keys:ident, 0) => {
-        $selected_keys[0].as_groupable_iter()?
-    };
-    ($selected_keys:ident, 1) => {
-        static_zip!($selected_keys, 0).zip($selected_keys[1].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 2) => {
-        static_zip!($selected_keys, 1).zip($selected_keys[2].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 3) => {
-        static_zip!($selected_keys, 2).zip($selected_keys[3].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 4) => {
-        static_zip!($selected_keys, 3).zip($selected_keys[4].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 5) => {
-        static_zip!($selected_keys, 4).zip($selected_keys[5].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 6) => {
-        static_zip!($selected_keys, 5).zip($selected_keys[6].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 7) => {
-        static_zip!($selected_keys, 6).zip($selected_keys[7].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 8) => {
-        static_zip!($selected_keys, 7).zip($selected_keys[8].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 9) => {
-        static_zip!($selected_keys, 8).zip($selected_keys[9].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 10) => {
-        static_zip!($selected_keys, 9).zip($selected_keys[10].as_groupable_iter()?)
-    };
-    ($selected_keys:ident, 11) => {
-        static_zip!($selected_keys, 10).zip($selected_keys[11].as_groupable_iter()?)
-    };
+macro_rules! apply_method_physical_numeric {
+    ($self:expr, $method:ident, $($args:expr),*) => {
+        match $self.dtype() {
+            DataType::Float32 => $self.f32().unwrap().$method($($args),*),
+            DataType::Float64 => $self.f64().unwrap().$method($($args),*),
+            _ => apply_method_physical_integer!($self, $method, $($args),*),
+        }
+    }
 }
 
 #[macro_export]
@@ -449,93 +423,212 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
     }
 
     match (l, r) {
-        (UInt8, Int8) => Some(Int8),
-        (UInt8, Int16) => Some(Int16),
-        (UInt8, Int32) => Some(Int32),
-        (UInt8, Int64) => Some(Int64),
+        #[cfg(feature = "dtype-i8")]
+        (Int8, Boolean) => Some(Int8),
+        //(Int8, Int8) => Some(Int8),
+        #[cfg(all(feature = "dtype-i8", feature = "dtype-i16"))]
+        (Int8, Int16) => Some(Int16),
+        #[cfg(feature = "dtype-i8")]
+        (Int8, Int32) => Some(Int32),
+        #[cfg(feature = "dtype-i8")]
+        (Int8, Int64) => Some(Int64),
+        #[cfg(all(feature = "dtype-i8", feature = "dtype-i16"))]
+        (Int8, UInt8) => Some(Int16),
+        #[cfg(all(feature = "dtype-i8", feature = "dtype-u16"))]
+        (Int8, UInt16) => Some(Int32),
+        #[cfg(feature = "dtype-i8")]
+        (Int8, UInt32) => Some(Int64),
+        #[cfg(feature = "dtype-i8")]
+        (Int8, UInt64) => Some(Float64), // Follow numpy
+        #[cfg(feature = "dtype-i8")]
+        (Int8, Float32) => Some(Float32),
+        #[cfg(feature = "dtype-i8")]
+        (Int8, Float64) => Some(Float64),
 
-        (UInt16, Int16) => Some(Int32),
-        (UInt16, Int32) => Some(Int32),
-        (UInt16, Int64) => Some(Int64),
-
-        (UInt32, Int32) => Some(Int64),
-        (UInt32, Int64) => Some(Int64),
-        // needed for bigidx
-        (UInt64, Int32) => Some(Int64),
-        (UInt64, Int64) => Some(Int64),
-
-        (Int8, UInt8) => Some(Int8),
-
+        #[cfg(feature = "dtype-i16")]
+        (Int16, Boolean) => Some(Int16),
+        #[cfg(all(feature = "dtype-i16", feature = "dtype-i8"))]
+        (Int16, Int8) => Some(Int16),
+        //(Int16, Int16) => Some(Int16),
+        #[cfg(feature = "dtype-i16")]
+        (Int16, Int32) => Some(Int32),
+        #[cfg(feature = "dtype-i16")]
+        (Int16, Int64) => Some(Int64),
+        #[cfg(all(feature = "dtype-i16", feature = "dtype-u8"))]
         (Int16, UInt8) => Some(Int16),
-        (Int16, UInt16) => Some(Int16),
+        #[cfg(all(feature = "dtype-i16", feature = "dtype-u16"))]
+        (Int16, UInt16) => Some(Int32),
+        #[cfg(feature = "dtype-i16")]
+        (Int16, UInt32) => Some(Int64),
+        #[cfg(feature = "dtype-i16")]
+        (Int16, UInt64) => Some(Float64), // Follow numpy
+        #[cfg(feature = "dtype-i16")]
+        (Int16, Float32) => Some(Float32),
+        #[cfg(feature = "dtype-i16")]
+        (Int16, Float64) => Some(Float64),
 
+        (Int32, Boolean) => Some(Int32),
+        #[cfg(feature = "dtype-i8")]
+        (Int32, Int8) => Some(Int32),
+        #[cfg(feature = "dtype-i16")]
+        (Int32, Int16) => Some(Int32),
+        //(Int32, Int32) => Some(Int32),
+        (Int32, Int64) => Some(Int64),
+        #[cfg(feature = "dtype-u8")]
         (Int32, UInt8) => Some(Int32),
+        #[cfg(feature = "dtype-u16")]
         (Int32, UInt16) => Some(Int32),
-        (Int32, UInt32) => Some(Int32),
+        (Int32, UInt32) => Some(Int64),
+        #[cfg(not(feature = "bigidx"))]
+        (Int32, UInt64) => Some(Float64), // Follow numpy
+        #[cfg(feature = "bigidx")]
+        (Int32, UInt64) => Some(Int64), // Needed for bigidx
+        (Int32, Float32) => Some(Float64), // Follow numpy
+        (Int32, Float64) => Some(Float64),
 
+        (Int64, Boolean) => Some(Int64),
+        #[cfg(feature = "dtype-i8")]
+        (Int64, Int8) => Some(Int64),
+        #[cfg(feature = "dtype-i16")]
+        (Int64, Int16) => Some(Int64),
+        (Int64, Int32) => Some(Int64),
+        //(Int64, Int64) => Some(Int64),
+        #[cfg(feature = "dtype-u8")]
         (Int64, UInt8) => Some(Int64),
+        #[cfg(feature = "dtype-u16")]
         (Int64, UInt16) => Some(Int64),
         (Int64, UInt32) => Some(Int64),
-        (Int64, UInt64) => Some(Int64),
+        #[cfg(not(feature = "bigidx"))]
+        (Int64, UInt64) => Some(Float64), // Follow numpy
+        #[cfg(feature = "bigidx")]
+        (Int64, UInt64) => Some(Int64), // Needed for bigidx
+        (Int64, Float32) => Some(Float64), // Follow numpy
+        (Int64, Float64) => Some(Float64),
 
-        (UInt8, UInt8) => Some(UInt8),
+        #[cfg(feature = "dtype-u8")]
+        (UInt8, Boolean) => Some(UInt8),
+        #[cfg(all(feature = "dtype-u8", feature = "dtype-i8"))]
+        (UInt8, Int8) => Some(Int16),
+        #[cfg(all(feature = "dtype-u8", feature = "dtype-i16"))]
+        (UInt8, Int16) => Some(Int16),
+        #[cfg(feature = "dtype-u8")]
+        (UInt8, Int32) => Some(Int32),
+        #[cfg(feature = "dtype-u8")]
+        (UInt8, Int64) => Some(Int64),
+        //(UInt8, UInt8) => Some(UInt8),
+        #[cfg(all(feature = "dtype-u8", feature = "dtype-u16"))]
         (UInt8, UInt16) => Some(UInt16),
+        #[cfg(feature = "dtype-u8")]
         (UInt8, UInt32) => Some(UInt32),
+        #[cfg(feature = "dtype-u8")]
         (UInt8, UInt64) => Some(UInt64),
+        #[cfg(feature = "dtype-u8")]
         (UInt8, Float32) => Some(Float32),
+        #[cfg(feature = "dtype-u8")]
         (UInt8, Float64) => Some(Float64),
 
+        #[cfg(feature = "dtype-u16")]
+        (UInt16, Boolean) => Some(UInt16),
+        #[cfg(all(feature = "dtype-u16", feature = "dtype-i8"))]
+        (UInt16, Int8) => Some(Int32),
+        #[cfg(feature = "dtype-u16")]
+        (UInt16, Int16) => Some(Int32),
+        #[cfg(feature = "dtype-u16")]
+        (UInt16, Int32) => Some(Int32),
+        #[cfg(feature = "dtype-u16")]
+        (UInt16, Int64) => Some(Int64),
+        #[cfg(all(feature = "dtype-u16", feature = "dtype-u8"))]
         (UInt16, UInt8) => Some(UInt16),
-        (UInt16, UInt16) => Some(UInt16),
+        //(UInt16, UInt16) => Some(UInt16),
+        #[cfg(feature = "dtype-u16")]
         (UInt16, UInt32) => Some(UInt32),
+        #[cfg(feature = "dtype-u16")]
         (UInt16, UInt64) => Some(UInt64),
+        #[cfg(feature = "dtype-u16")]
         (UInt16, Float32) => Some(Float32),
+        #[cfg(feature = "dtype-u16")]
         (UInt16, Float64) => Some(Float64),
 
-        (UInt32, UInt8) => Some(UInt32),
-        (UInt32, UInt16) => Some(UInt32),
-        (UInt32, UInt32) => Some(UInt32),
-        (UInt32, UInt64) => Some(UInt64),
-        (UInt32, Float32) => Some(Float32),
-        (UInt32, Float64) => Some(Float64),
         (UInt32, Boolean) => Some(UInt32),
+        #[cfg(feature = "dtype-i8")]
+        (UInt32, Int8) => Some(Int64),
+        #[cfg(feature = "dtype-i16")]
+        (UInt32, Int16) => Some(Int64),
+        (UInt32, Int32) => Some(Int64),
+        (UInt32, Int64) => Some(Int64),
+        #[cfg(feature = "dtype-u8")]
+        (UInt32, UInt8) => Some(UInt32),
+        #[cfg(feature = "dtype-u16")]
+        (UInt32, UInt16) => Some(UInt32),
+        //(UInt32, UInt32) => Some(UInt32),
+        (UInt32, UInt64) => Some(UInt64),
+        (UInt32, Float32) => Some(Float64), // Follow numpy
+        (UInt32, Float64) => Some(Float64),
+
+        (UInt64, Boolean) => Some(UInt64),
+        #[cfg(feature = "dtype-i8")]
+        (UInt64, Int8) => Some(Float64), // Follow numpy
+        #[cfg(feature = "dtype-i16")]
+        (UInt64, Int16) => Some(Float64), // Follow numpy
+        #[cfg(not(feature = "bigidx"))]
+        (UInt64, Int32) => Some(Float64), // Follow numpy
+        #[cfg(feature = "bigidx")]
+        (UInt64, Int32) => Some(Int64), // Needed for bigidx
+        #[cfg(not(feature = "bigidx"))]
+        (UInt64, Int64) => Some(Float64), // Follow numpy
+        #[cfg(feature = "bigidx")]
+        (UInt64, Int64) => Some(Int64), // Needed for bigidx
+        #[cfg(feature = "dtype-u8")]
+        (UInt64, UInt8) => Some(UInt64),
+        #[cfg(feature = "dtype-u16")]
+        (UInt64, UInt16) => Some(UInt64),
+        (UInt64, UInt32) => Some(UInt64),
+        //(UInt64, UInt64) => Some(UInt64),
+        (UInt64, Float32) => Some(Float64), // Follow numpy
+        (UInt64, Float64) => Some(Float64),
+
+        (Float32, Boolean) => Some(Float32),
+        #[cfg(feature = "dtype-i8")]
+        (Float32, Int8) => Some(Float32),
+        #[cfg(feature = "dtype-i16")]
+        (Float32, Int16) => Some(Float32),
+        (Float32, Int32) => Some(Float64),
+        (Float32, Int64) => Some(Float64),
+        #[cfg(feature = "dtype-u8")]
+        (Float32, UInt8) => Some(Float32),
+        #[cfg(feature = "dtype-u16")]
+        (Float32, UInt16) => Some(Float32),
+        (Float32, UInt32) => Some(Float64),
+        (Float32, UInt64) => Some(Float64),
+        //(Float32, Float32) => Some(Float32),
+        (Float32, Float64) => Some(Float64),
+
+        (Float64, Boolean) => Some(Float64),
+        #[cfg(feature = "dtype-i8")]
+        (Float64, Int8) => Some(Float64),
+        #[cfg(feature = "dtype-i16")]
+        (Float64, Int16) => Some(Float64),
+        (Float64, Int32) => Some(Float64),
+        (Float64, Int64) => Some(Float64),
+        #[cfg(feature = "dtype-u8")]
+        (Float64, UInt8) => Some(Float64),
+        #[cfg(feature = "dtype-u16")]
+        (Float64, UInt16) => Some(Float64),
+        (Float64, UInt32) => Some(Float64),
+        (Float64, UInt64) => Some(Float64),
+        (Float64, Float32) => Some(Float64),
+        //(Float64, Float64) => Some(Float64),
+
+        // Time related dtypes
         #[cfg(feature = "dtype-date")]
         (UInt32, Date) => Some(Int64),
         #[cfg(feature = "dtype-datetime")]
         (UInt32, Datetime(_, _)) => Some(Int64),
         #[cfg(feature = "dtype-duration")]
         (UInt32, Duration(_)) => Some(Int64),
+        #[cfg(feature = "dtype-time")]
+        (UInt32, Time) => Some(Int64),
 
-        (UInt64, UInt8) => Some(UInt64),
-        (UInt64, UInt16) => Some(UInt64),
-        (UInt64, UInt32) => Some(UInt64),
-        (UInt64, UInt64) => Some(UInt64),
-        (UInt64, Float32) => Some(Float32),
-        (UInt64, Float64) => Some(Float64),
-        (UInt64, Boolean) => Some(UInt64),
-
-        (Int8, Int8) => Some(Int8),
-        (Int8, Int16) => Some(Int16),
-        (Int8, Int32) => Some(Int32),
-        (Int8, Int64) => Some(Int64),
-        (Int8, Float32) => Some(Float32),
-        (Int8, Float64) => Some(Float64),
-        (Int8, Boolean) => Some(Int8),
-
-        (Int16, Int8) => Some(Int16),
-        (Int16, Int16) => Some(Int16),
-        (Int16, Int32) => Some(Int32),
-        (Int16, Int64) => Some(Int64),
-        (Int16, Float32) => Some(Float32),
-        (Int16, Float64) => Some(Float64),
-        (Int16, Boolean) => Some(Int16),
-
-        (Int32, Int8) => Some(Int32),
-        (Int32, Int16) => Some(Int32),
-        (Int32, Int32) => Some(Int32),
-        (Int32, Int64) => Some(Int64),
-        (Int32, Float32) => Some(Float32),
-        (Int32, Float64) => Some(Float64),
         #[cfg(feature = "dtype-date")]
         (Int32, Date) => Some(Int32),
         #[cfg(feature = "dtype-datetime")]
@@ -544,26 +637,16 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
         (Int32, Duration(_)) => Some(Int64),
         #[cfg(feature = "dtype-time")]
         (Int32, Time) => Some(Int64),
-        (Int32, Boolean) => Some(Int32),
 
-        (Int64, Int8) => Some(Int64),
-        (Int64, Int16) => Some(Int64),
-        (Int64, Int32) => Some(Int64),
-        (Int64, Int64) => Some(Int64),
-        (Int64, Float32) => Some(Float32),
-        (Int64, Float64) => Some(Float64),
         #[cfg(feature = "dtype-datetime")]
         (Int64, Datetime(_, _)) => Some(Int64),
         #[cfg(feature = "dtype-duration")]
         (Int64, Duration(_)) => Some(Int64),
         #[cfg(feature = "dtype-date")]
-        (Int64, Date) => Some(Int32),
+        (Int64, Date) => Some(Int64),
         #[cfg(feature = "dtype-time")]
         (Int64, Time) => Some(Int64),
-        (Int64, Boolean) => Some(Int64),
 
-        (Float32, Float32) => Some(Float32),
-        (Float32, Float64) => Some(Float64),
         #[cfg(feature = "dtype-date")]
         (Float32, Date) => Some(Float32),
         #[cfg(feature = "dtype-datetime")]
@@ -572,8 +655,7 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
         (Float32, Duration(_)) => Some(Float64),
         #[cfg(feature = "dtype-time")]
         (Float32, Time) => Some(Float64),
-        (Float64, Float32) => Some(Float64),
-        (Float64, Float64) => Some(Float64),
+
         #[cfg(feature = "dtype-date")]
         (Float64, Date) => Some(Float64),
         #[cfg(feature = "dtype-datetime")]
@@ -582,36 +664,35 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
         (Float64, Duration(_)) => Some(Float64),
         #[cfg(feature = "dtype-time")]
         (Float64, Time) => Some(Float64),
-        (Float64, Boolean) => Some(Float64),
 
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(feature = "dtype-date")]
         (Date, UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(feature = "dtype-date")]
         (Date, UInt64) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(feature = "dtype-date")]
         (Date, Int32) => Some(Int32),
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(feature = "dtype-date")]
         (Date, Int64) => Some(Int64),
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(feature = "dtype-date")]
         (Date, Float32) => Some(Float32),
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(feature = "dtype-date")]
         (Date, Float64) => Some(Float64),
-        #[cfg(feature = "dtype-datetime")]
+        #[cfg(all(feature = "dtype-date", feature = "dtype-datetime"))]
         (Date, Datetime(tu, tz)) => Some(Datetime(*tu, tz.clone())),
 
-        #[cfg(feature = "dtype-date")]
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(_, _), UInt32) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(_, _), UInt64) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(_, _), Int32) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(_, _), Int64) => Some(Int64),
-        #[cfg(feature = "dtype-date")]
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(_, _), Float32) => Some(Float64),
-        #[cfg(feature = "dtype-date")]
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(_, _), Float64) => Some(Float64),
-        #[cfg(feature = "dtype-date")]
+        #[cfg(all(feature = "dtype-datetime", feature = "dtype=date"))]
         (Datetime(tu, tz), Date) => Some(Datetime(*tu, tz.clone())),
 
         #[cfg(feature = "dtype-duration")]
@@ -638,22 +719,26 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
 
         #[cfg(all(feature = "dtype-time", feature = "dtype-datetime"))]
         (Time, Datetime(_, _)) => Some(Int64),
-        #[cfg(all(feature = "dtype-time", feature = "dtype-datetime"))]
+        #[cfg(all(feature = "dtype-datetime", feature = "dtype-time"))]
         (Datetime(_, _), Time) => Some(Int64),
         #[cfg(all(feature = "dtype-time", feature = "dtype-date"))]
         (Time, Date) => Some(Int64),
-        #[cfg(all(feature = "dtype-time", feature = "dtype-date"))]
+        #[cfg(all(feature = "dtype-date", feature = "dtype-time"))]
         (Date, Time) => Some(Int64),
 
         (Utf8, _) => Some(Utf8),
         (_, Utf8) => Some(Utf8),
 
         (Boolean, Boolean) => Some(Boolean),
+        #[cfg(feature = "dtype-i8")]
         (Boolean, Int8) => Some(Int8),
+        #[cfg(feature = "dtype-i16")]
         (Boolean, Int16) => Some(Int16),
         (Boolean, Int32) => Some(Int32),
         (Boolean, Int64) => Some(Int64),
+        #[cfg(feature = "dtype-u8")]
         (Boolean, UInt8) => Some(UInt8),
+        #[cfg(feature = "dtype-u16")]
         (Boolean, UInt16) => Some(UInt16),
         (Boolean, UInt32) => Some(UInt32),
         (Boolean, UInt64) => Some(UInt64),
@@ -663,6 +748,7 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
         (dt, Null) => Some(dt.clone()),
         (Null, dt) => Some(dt.clone()),
 
+        #[cfg(all(feature = "dtype-duration", feature = "dtype-datetime"))]
         (Duration(lu), Datetime(ru, Some(tz))) | (Datetime(lu, Some(tz)), Duration(ru)) => {
             if tz.is_empty() {
                 Some(Datetime(get_time_units(lu, ru), None))
@@ -670,20 +756,28 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
                 Some(Datetime(get_time_units(lu, ru), Some(tz.clone())))
             }
         }
+        #[cfg(all(feature = "dtype-duration", feature = "dtype-datetime"))]
         (Duration(lu), Datetime(ru, None)) | (Datetime(lu, None), Duration(ru)) => {
             Some(Datetime(get_time_units(lu, ru), None))
         }
+        #[cfg(all(feature = "dtype-duration", feature = "dtype-date"))]
         (Duration(_), Date) | (Date, Duration(_)) => Some(Datetime(TimeUnit::Milliseconds, None)),
+        #[cfg(feature = "dtype-duration")]
         (Duration(lu), Duration(ru)) => Some(Duration(get_time_units(lu, ru))),
 
         // None and Some("") timezones
         // we cast from more precision to higher precision as that always fits with occasional loss of precision
+        #[cfg(feature = "dtype-datetime")]
         (Datetime(tu_l, tz_l), Datetime(tu_r, tz_r))
             if (tz_l.is_none() || tz_l.as_deref() == Some(""))
                 && (tz_r.is_none() || tz_r.as_deref() == Some("")) =>
         {
             let tu = get_time_units(tu_l, tu_r);
             Some(Datetime(tu, None))
+        }
+        (List(inner), other) | (other, List(inner)) => {
+            let st = _get_supertype(inner, other)?;
+            Some(DataType::List(Box::new(st)))
         }
         _ => None,
     }
@@ -796,6 +890,34 @@ where
                 Cow::Borrowed(right),
             )
         }
+    }
+}
+
+#[cfg(feature = "performant")]
+pub(crate) fn align_chunks_binary_owned_series(left: Series, right: Series) -> (Series, Series) {
+    match (left.chunks().len(), right.chunks().len()) {
+        (1, 1) => (left, right),
+        (_, 1) => (left.rechunk(), right),
+        (1, _) => (left, right.rechunk()),
+        (_, _) => (left.rechunk(), right.rechunk()),
+    }
+}
+
+pub(crate) fn align_chunks_binary_owned<T, B>(
+    left: ChunkedArray<T>,
+    right: ChunkedArray<B>,
+) -> (ChunkedArray<T>, ChunkedArray<B>)
+where
+    ChunkedArray<B>: ChunkOps,
+    ChunkedArray<T>: ChunkOps,
+    B: PolarsDataType,
+    T: PolarsDataType,
+{
+    match (left.chunks.len(), right.chunks.len()) {
+        (1, 1) => (left, right),
+        (_, 1) => (left.rechunk(), right),
+        (1, _) => (left, right.rechunk()),
+        (_, _) => (left.rechunk(), right.rechunk()),
     }
 }
 

@@ -18,7 +18,8 @@ impl Executor for GroupByRollingExec {
 
     #[cfg(feature = "dynamic_groupby")]
     fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
-        let df = self.input.execute(state)?;
+        let mut df = self.input.execute(state)?;
+        df.as_single_chunk_par();
         state.set_schema(self.input_schema.clone());
 
         let keys = self
@@ -43,7 +44,7 @@ impl Executor for GroupByRollingExec {
                     self.aggs
                         .par_iter()
                         .map(|expr| {
-                            let agg = as_aggregated(expr.as_ref(), &df, groups, state)?;
+                            let agg = expr.evaluate_on_groups(&df, groups, state)?.aggregated();
                             if agg.len() != groups.len() {
                                 return Err(PolarsError::ComputeError(
                                     format!("returned aggregation is a different length: {} than the group lengths: {}",

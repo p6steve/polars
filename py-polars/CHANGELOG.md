@@ -10,7 +10,7 @@ The Rust crate `polars` has its own changelog.
 **Merged pull requests:**
 
 - python collect\_all function [\#1503](https://github.com/pola-rs/polars/pull/1503) ([ritchie46](https://github.com/ritchie46))
-- python: remove deprecated code/funcitonallity [\#1502](https://github.com/pola-rs/polars/pull/1502) ([ritchie46](https://github.com/ritchie46))
+- python: remove deprecated code/functionallity [\#1502](https://github.com/pola-rs/polars/pull/1502) ([ritchie46](https://github.com/ritchie46))
 - Refactor Date/Datetime dtypes [\#1501](https://github.com/pola-rs/polars/pull/1501) ([ritchie46](https://github.com/ritchie46))
 - add vertical string concat; closes \#1490 [\#1500](https://github.com/pola-rs/polars/pull/1500) ([ritchie46](https://github.com/ritchie46))
 - fix bug in outer\_join functions, add tests [\#1498](https://github.com/pola-rs/polars/pull/1498) ([marcvanheerden](https://github.com/marcvanheerden))
@@ -39,7 +39,7 @@ The Rust crate `polars` has its own changelog.
 - improve hashing performance w/ specialized hashers  [\#1405](https://github.com/pola-rs/polars/pull/1405) ([ritchie46](https://github.com/ritchie46))
 - categorical aggregation output consistency [\#1403](https://github.com/pola-rs/polars/pull/1403) ([ritchie46](https://github.com/ritchie46))
 - fix apply with list output type [\#1402](https://github.com/pola-rs/polars/pull/1402) ([ritchie46](https://github.com/ritchie46))
-- expose categorical round trip to python and add more dictonary types:… [\#1399](https://github.com/pola-rs/polars/pull/1399) ([ritchie46](https://github.com/ritchie46))
+- expose categorical round trip to python and add more dictionary types:… [\#1399](https://github.com/pola-rs/polars/pull/1399) ([ritchie46](https://github.com/ritchie46))
 - fix invalid ReplaceDropNulls optimization [\#1398](https://github.com/pola-rs/polars/pull/1398) ([ritchie46](https://github.com/ritchie46))
 - fix memcpy of multiple chunks; closes 1396 [\#1397](https://github.com/pola-rs/polars/pull/1397) ([ritchie46](https://github.com/ritchie46))
 - Workflow to generate m1 wheels [\#1394](https://github.com/pola-rs/polars/pull/1394) ([tiphaineruy](https://github.com/tiphaineruy))
@@ -85,7 +85,7 @@ The Rust crate `polars` has its own changelog.
 
 **Closed issues:**
 
-- Adding an optional suffix to overlaping columns when joining dataframes [\#1432](https://github.com/pola-rs/polars/issues/1432)
+- Adding an optional suffix to overlapping columns when joining dataframes [\#1432](https://github.com/pola-rs/polars/issues/1432)
 - collect reverse [\#1429](https://github.com/pola-rs/polars/issues/1429)
 - indexing bool column gives NotImplemented error [\#1422](https://github.com/pola-rs/polars/issues/1422)
 - use `sep` instead of `delimiter` in DataFrame.to\_csv [\#1415](https://github.com/pola-rs/polars/issues/1415)
@@ -237,7 +237,7 @@ The Rust crate `polars` has its own changelog.
 
 - pyo3\_runtime.PanicException: should already be coerced to u64 when joining two DataFrames [\#1231](https://github.com/pola-rs/polars/issues/1231)
 - Error when performing modulo operation '%" [\#1230](https://github.com/pola-rs/polars/issues/1230)
-- CsvReader ignores the last charactor if there's no newline at EOF [\#1229](https://github.com/pola-rs/polars/issues/1229)
+- CsvReader ignores the last character if there's no newline at EOF [\#1229](https://github.com/pola-rs/polars/issues/1229)
 - Bad link in doc [\#1227](https://github.com/pola-rs/polars/issues/1227)
 
 ## [py-polars-v0.8.28](https://github.com/pola-rs/polars/tree/py-polars-v0.8.28) (2021-08-26)
@@ -345,7 +345,7 @@ The Rust crate `polars` has its own changelog.
 - Only first gzip stream of gzipped CSV/TSV files with multiple gzip streams is read. [\#1126](https://github.com/pola-rs/polars/issues/1126)
 - implement `__copy__, __deepcopy__` [\#1120](https://github.com/pola-rs/polars/issues/1120)
 - pretty print failure output of `frame_equal` assertions [\#1112](https://github.com/pola-rs/polars/issues/1112)
-- PanicException when converting non-Utf8 column to Catergorical. [\#1107](https://github.com/pola-rs/polars/issues/1107)
+- PanicException when converting non-Utf8 column to Categorical. [\#1107](https://github.com/pola-rs/polars/issues/1107)
 - read\_csv of a compressed file fails when selecting a subset of columns [\#1026](https://github.com/pola-rs/polars/issues/1026)
 - csv-parser: remove dependency on csv crate. [\#956](https://github.com/pola-rs/polars/issues/956)
 
@@ -553,7 +553,7 @@ patch release to fix panic #1077
 ### polars 0.7.16
 * feature
   - Series literal may have any length
-  - change globaly string cache behavior
+  - change globally string cache behavior
   - Add Expr.arg_sort
   - Make literals typed
 
@@ -643,7 +643,7 @@ patch release to fix panic #1077
 * feature
   - cast categorical in csv parser: #533
   - add many groupby-context aware operations: #534
-  - dowcast by month: #537
+  - downcast by month: #537
 
 * performance
   - improve iterator in no null case: #538

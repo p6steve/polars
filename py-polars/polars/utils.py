@@ -7,6 +7,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, U
 
 import numpy as np
 
+try:
+    from polars.polars import pool_size as _pool_size
+
+    _DOCUMENTING = False
+except ImportError:  # pragma: no cover
+    _DOCUMENTING = True
+
 from polars.datatypes import DataType, Date, Datetime
 
 if sys.version_info >= (3, 10):
@@ -182,7 +189,10 @@ EPOCH = datetime(1970, 1, 1).replace(tzinfo=None)
 
 
 def _to_python_datetime(
-    value: Union[int, float], dtype: Type[DataType], tu: Optional[str] = "ns"
+    value: Union[int, float],
+    dtype: Type[DataType],
+    tu: Optional[str] = "ns",
+    tz: Optional["str"] = None,
 ) -> Union[date, datetime]:
     if dtype == Date:
         # days to seconds
@@ -192,14 +202,21 @@ def _to_python_datetime(
     elif dtype == Datetime:
         if tu == "ns":
             # nanoseconds to seconds
-            return EPOCH + timedelta(microseconds=value / 1000)
-        if tu == "us":
-            return EPOCH + timedelta(microseconds=value)
+            dt = EPOCH + timedelta(microseconds=value / 1000)
+        elif tu == "us":
+            dt = EPOCH + timedelta(microseconds=value)
         elif tu == "ms":
             # milliseconds to seconds
-            return datetime.utcfromtimestamp(value / 1_000)
+            dt = datetime.utcfromtimestamp(value / 1_000)
         else:
             raise ValueError(f"time unit: {tu} not expected")
+        if tz is not None and len(tz) > 0:
+            import pytz
+
+            timezone = pytz.timezone(tz)
+            return timezone.localize(dt)
+        return dt
+
     else:
         raise NotImplementedError  # pragma: no cover
 
@@ -222,3 +239,10 @@ def format_path(path: Union[str, Path]) -> str:
     Returns a string path, expanding the home directory if present.
     """
     return os.path.expanduser(path)
+
+
+def threadpool_size() -> int:
+    """
+    Get the size of polars; thread pool
+    """
+    return _pool_size()

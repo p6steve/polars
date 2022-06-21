@@ -111,8 +111,9 @@ fn test_exploded_window_function() -> Result<()> {
         ])
         .collect()?;
 
+    // even though we fill with f32, cast i32 -> f32 can overflow so the result is f64
     assert_eq!(
-        Vec::from(out.column("shifted")?.f32()?),
+        Vec::from(out.column("shifted")?.f64()?),
         &[Some(-1.0), Some(3.0), Some(-1.0), Some(5.0), Some(4.0)]
     );
     Ok(())
@@ -383,5 +384,20 @@ fn test_window_naive_any() -> Result<()> {
 
     let res = df.column("res")?;
     assert_eq!(res.sum::<usize>(), Some(5));
+    Ok(())
+}
+
+#[test]
+fn test_window_map_empty_df_3542() -> Result<()> {
+    let df = df![
+        "x" => ["a", "b", "c"],
+        "y" => [Some(1), None, Some(3)]
+    ]?;
+    let out = df
+        .lazy()
+        .filter(col("y").lt(0))
+        .select([col("y").fill_null(0).last().over([col("y")])])
+        .collect()?;
+    assert_eq!(out.height(), 0);
     Ok(())
 }

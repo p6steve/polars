@@ -3,9 +3,12 @@ use crate::chunked_array::cast::cast_chunks;
 use crate::chunked_array::object::extension::polars_extension::PolarsExtension;
 use crate::prelude::*;
 use arrow::compute::cast::utf8_to_large_utf8;
-use arrow::temporal_conversions::MILLISECONDS;
-#[cfg(feature = "dtype-time")]
-use arrow::temporal_conversions::NANOSECONDS;
+#[cfg(any(
+    feature = "dtype-date",
+    feature = "dtype-datetime",
+    feature = "dtype-time"
+))]
+use arrow::temporal_conversions::*;
 use polars_arrow::compute::cast::cast;
 #[cfg(feature = "dtype-struct")]
 use polars_arrow::kernels::concatenate::concatenate_owned_unchecked;
@@ -87,7 +90,7 @@ impl Series {
         match dtype {
             ArrowDataType::LargeUtf8 => Ok(Utf8Chunked::from_chunks(name, chunks).into_series()),
             ArrowDataType::Utf8 => {
-                let chunks = cast_chunks(&chunks, &DataType::Utf8).unwrap();
+                let chunks = cast_chunks(&chunks, &DataType::Utf8, false).unwrap();
                 Ok(Utf8Chunked::from_chunks(name, chunks).into_series())
             }
             ArrowDataType::List(_) => {
@@ -111,27 +114,28 @@ impl Series {
             ArrowDataType::Float64 => Ok(Float64Chunked::from_chunks(name, chunks).into_series()),
             #[cfg(feature = "dtype-date")]
             ArrowDataType::Date32 => {
-                let chunks = cast_chunks(&chunks, &DataType::Int32).unwrap();
+                let chunks = cast_chunks(&chunks, &DataType::Int32, false).unwrap();
                 Ok(Int32Chunked::from_chunks(name, chunks)
                     .into_date()
                     .into_series())
             }
             #[cfg(feature = "dtype-datetime")]
             ArrowDataType::Date64 => {
-                let chunks = cast_chunks(&chunks, &DataType::Int64).unwrap();
+                let chunks = cast_chunks(&chunks, &DataType::Int64, false).unwrap();
                 let ca = Int64Chunked::from_chunks(name, chunks);
                 Ok(ca.into_datetime(TimeUnit::Milliseconds, None).into_series())
             }
             #[cfg(feature = "dtype-datetime")]
             ArrowDataType::Timestamp(tu, tz) => {
-                // we still drop timezone for now
-                let chunks = cast_chunks(&chunks, &DataType::Int64).unwrap();
-                let s = Int64Chunked::from_chunks(name, chunks)
-                    .into_datetime(tu.into(), None)
-                    .into_series();
-                if !(tz.is_none() || tz == &Some("".to_string())) {
-                    println!("Conversion of timezone aware to naive datetimes. TZ information may be lost.")
+                let mut tz = tz.clone();
+                if tz.as_deref() == Some("") {
+                    tz = None;
                 }
+                // we still drop timezone for now
+                let chunks = cast_chunks(&chunks, &DataType::Int64, false).unwrap();
+                let s = Int64Chunked::from_chunks(name, chunks)
+                    .into_datetime(tu.into(), tz)
+                    .into_series();
                 Ok(match tu {
                     ArrowTimeUnit::Second => &s * MILLISECONDS,
                     ArrowTimeUnit::Millisecond => s,
@@ -141,7 +145,7 @@ impl Series {
             }
             #[cfg(feature = "dtype-duration")]
             ArrowDataType::Duration(tu) => {
-                let chunks = cast_chunks(&chunks, &DataType::Int64).unwrap();
+                let chunks = cast_chunks(&chunks, &DataType::Int64, false).unwrap();
                 let s = Int64Chunked::from_chunks(name, chunks)
                     .into_duration(tu.into())
                     .into_series();
@@ -156,9 +160,9 @@ impl Series {
             ArrowDataType::Time64(tu) | ArrowDataType::Time32(tu) => {
                 let mut chunks = chunks;
                 if matches!(dtype, ArrowDataType::Time32(_)) {
-                    chunks = cast_chunks(&chunks, &DataType::Int32).unwrap();
+                    chunks = cast_chunks(&chunks, &DataType::Int32, false).unwrap();
                 }
-                let chunks = cast_chunks(&chunks, &DataType::Int64).unwrap();
+                let chunks = cast_chunks(&chunks, &DataType::Int64, false).unwrap();
                 let s = Int64Chunked::from_chunks(name, chunks)
                     .into_time()
                     .into_series();
@@ -191,133 +195,53 @@ impl Series {
                 let chunks = chunks.iter().map(|arr| &**arr).collect::<Vec<_>>();
                 let arr = arrow::compute::concatenate::concatenate(&chunks)?;
 
-                let (keys, values) = match (key_type, &**value_type) {
-                    (IntegerType::Int8, ArrowDataType::LargeUtf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i8>>().unwrap();
+                if !matches!(
+                    value_type.as_ref(),
+                    ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
+                ) {
+                    return Err(PolarsError::ComputeError(
+                        "polars only support dictionaries with string like values".into(),
+                    ));
+                }
+
+                macro_rules! unpack_keys_values {
+                    ($dt:ty) => {{
+                        let arr = arr.as_any().downcast_ref::<DictionaryArray<$dt>>().unwrap();
                         let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
+                        let keys = cast(keys, &ArrowDataType::UInt32).unwrap();
                         let values = arr.values();
-                        let values = values.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                        (keys, values.clone())
-                    }
-                    (IntegerType::Int16, ArrowDataType::LargeUtf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i16>>().unwrap();
-                        let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                        (keys, values.clone())
-                    }
-                    (IntegerType::Int32, ArrowDataType::LargeUtf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i32>>().unwrap();
-                        let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                        (keys, values.clone())
-                    }
-                    (IntegerType::Int64, ArrowDataType::LargeUtf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i64>>().unwrap();
-                        let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                        (keys, values.clone())
-                    }
-                    (IntegerType::UInt32, ArrowDataType::LargeUtf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<u32>>().unwrap();
-                        let keys = arr.keys();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                        (keys.clone(), values.clone())
-                    }
-                    (IntegerType::Int8, ArrowDataType::Utf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i8>>().unwrap();
-                        let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<Utf8Array<i32>>().unwrap();
-                        let values = cast(values, &ArrowDataType::LargeUtf8)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<Utf8Array<i64>>()
-                            .unwrap()
-                            .clone();
+                        let values = cast(&**values, &ArrowDataType::LargeUtf8)?;
                         (keys, values)
+                    }};
+                }
+
+                let (keys, values) = match key_type {
+                    IntegerType::Int8 => {
+                        unpack_keys_values!(i8)
                     }
-                    (IntegerType::Int16, ArrowDataType::Utf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i16>>().unwrap();
-                        let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<Utf8Array<i32>>().unwrap();
-                        let values = cast(values, &ArrowDataType::LargeUtf8)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<Utf8Array<i64>>()
-                            .unwrap()
-                            .clone();
-                        (keys, values)
+                    IntegerType::UInt8 => {
+                        unpack_keys_values!(u8)
                     }
-                    (IntegerType::Int32, ArrowDataType::Utf8) => {
-                        let arr = arr.as_any().downcast_ref::<DictionaryArray<i32>>().unwrap();
-                        let keys = arr.keys();
-                        let keys = cast(keys, &ArrowDataType::UInt32)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<PrimitiveArray<u32>>()
-                            .unwrap()
-                            .clone();
-                        let values = arr.values();
-                        let values = values.as_any().downcast_ref::<Utf8Array<i32>>().unwrap();
-                        let values = cast(values, &ArrowDataType::LargeUtf8)
-                            .unwrap()
-                            .as_any()
-                            .downcast_ref::<Utf8Array<i64>>()
-                            .unwrap()
-                            .clone();
-                        (keys, values)
+                    IntegerType::Int16 => {
+                        unpack_keys_values!(i16)
                     }
-                    (k, v) => {
-                        return Err(PolarsError::InvalidOperation(
-                            format!(
-                            "Cannot create polars series dictionary type of key:  {:?} value: {:?}",
-                            k, v
-                        )
-                            .into(),
+                    IntegerType::UInt16 => {
+                        unpack_keys_values!(u16)
+                    }
+                    IntegerType::Int32 => {
+                        unpack_keys_values!(i32)
+                    }
+                    IntegerType::UInt32 => {
+                        unpack_keys_values!(u32)
+                    }
+                    _ => {
+                        return Err(PolarsError::ComputeError(
+                            "dictionaries with 64 bits keys are not supported by polars".into(),
                         ))
                     }
                 };
+                let keys = keys.as_any().downcast_ref::<PrimitiveArray<u32>>().unwrap();
+                let values = values.as_any().downcast_ref::<Utf8Array<i64>>().unwrap();
 
                 let mut builder = CategoricalChunkedBuilder::new(name, keys.len());
                 let iter = keys
@@ -342,14 +266,16 @@ impl Series {
                         let offsets = arr.offsets().clone();
                         let validity = arr.validity().cloned();
 
-                        let values = Arc::new(PrimitiveArray::from_data(
+                        let values = Box::new(PrimitiveArray::from_data(
                             ArrowDataType::UInt8,
                             values,
                             None,
                         ));
 
                         let dtype = ListArray::<i64>::default_datatype(ArrowDataType::UInt8);
-                        Arc::new(ListArray::<i64>::from_data(
+                        // Safety:
+                        // offsets are monotonically increasing
+                        Box::new(ListArray::<i64>::new_unchecked(
                             dtype, offsets, values, validity,
                         )) as ArrayRef
                     })
@@ -390,13 +316,9 @@ impl Series {
                     let new_values = struct_arr
                         .values()
                         .iter()
-                        .map(|arr| {
-                            Arc::from(match arr.validity() {
-                                None => arr.with_validity(Some(validity.clone())),
-                                Some(arr_validity) => {
-                                    arr.with_validity(Some(arr_validity & validity))
-                                }
-                            })
+                        .map(|arr| match arr.validity() {
+                            None => arr.with_validity(Some(validity.clone())),
+                            Some(arr_validity) => arr.with_validity(Some(arr_validity & validity)),
                         })
                         .collect();
 
@@ -431,18 +353,18 @@ fn convert_inner_types(arr: &ArrayRef) -> ArrayRef {
     match arr.data_type() {
         ArrowDataType::Utf8 => {
             let arr = arr.as_any().downcast_ref::<Utf8Array<i32>>().unwrap();
-            Arc::from(utf8_to_large_utf8(arr))
+            Box::from(utf8_to_large_utf8(arr))
         }
         ArrowDataType::List(field) => {
             let out = cast(&**arr, &ArrowDataType::LargeList(field.clone())).unwrap();
-            convert_inner_types(&(Arc::from(out) as ArrayRef))
+            convert_inner_types(&out)
         }
         ArrowDataType::LargeList(_) => {
             let arr = arr.as_any().downcast_ref::<ListArray<i64>>().unwrap();
             let values = convert_inner_types(arr.values());
             let dtype = ListArray::<i64>::default_datatype(values.data_type().clone());
             unsafe {
-                Arc::from(ListArray::<i64>::new_unchecked(
+                Box::from(ListArray::<i64>::new_unchecked(
                     dtype,
                     arr.offsets().clone(),
                     values,
@@ -462,7 +384,7 @@ fn convert_inner_types(arr: &ArrayRef) -> ArrayRef {
                 .iter()
                 .map(|f| ArrowField::new(&f.name, DataType::from(&f.data_type).to_arrow(), true))
                 .collect();
-            Arc::new(StructArray::new(
+            Box::new(StructArray::new(
                 ArrowDataType::Struct(fields),
                 values,
                 arr.validity().cloned(),
@@ -505,15 +427,6 @@ impl TryFrom<(&str, ArrayRef)> for Series {
     fn try_from(name_arr: (&str, ArrayRef)) -> Result<Self> {
         let (name, arr) = name_arr;
         Series::try_from((name, vec![arr]))
-    }
-}
-
-impl TryFrom<(&str, Box<dyn Array>)> for Series {
-    type Error = PolarsError;
-
-    fn try_from(name_arr: (&str, Box<dyn Array>)) -> Result<Self> {
-        let (name, arr) = name_arr;
-        Series::try_from((name, vec![arr.into()]))
     }
 }
 
@@ -589,7 +502,7 @@ mod test {
     #[cfg(feature = "dtype-u8")]
     fn test_binary_to_list() {
         let iter = std::iter::repeat(b"hello").take(2).map(Some);
-        let a = Arc::new(iter.collect::<BinaryArray<i32>>()) as ArrayRef;
+        let a = Box::new(iter.collect::<BinaryArray<i32>>()) as ArrayRef;
 
         let s = Series::try_from(("", a)).unwrap();
         assert_eq!(s.dtype(), &DataType::List(Box::new(DataType::UInt8)));

@@ -23,6 +23,7 @@ from polars.datatypes import (
     Float64,
     Int32,
     Object,
+    Time,
     UInt32,
     py_type_to_dtype,
 )
@@ -132,7 +133,7 @@ class Expr:
     def __rmod__(self, other: Any) -> "Expr":
         return wrap_expr(self.__to_pyexpr(other) % self._pyexpr)
 
-    def __pow__(self, power: float, modulo: None = None) -> "Expr":
+    def __pow__(self, power: Union[float, "Expr"], modulo: None = None) -> "Expr":
         return self.pow(power)
 
     def __ge__(self, other: Any) -> "Expr":
@@ -240,7 +241,7 @@ class Expr:
         """
         Compute the square root of the elements
         """
-        return self ** 0.5
+        return self**0.5
 
     def log10(self) -> "Expr":
         """
@@ -252,7 +253,7 @@ class Expr:
         """
         Return the exponential element-wise
         """
-        return np.exp(self)  # type: ignore
+        return wrap_expr(self._pyexpr.exp())
 
     def alias(self, name: str) -> "Expr":
         """
@@ -309,7 +310,13 @@ class Expr:
 
     def exclude(
         self,
-        columns: Union[str, List[str], Type[DataType], Sequence[Type[DataType]]],
+        columns: Union[
+            str,
+            List[str],
+            Union[DataType, Type[DataType]],
+            DataType,
+            Sequence[Union[DataType, Type[DataType]]],
+        ],
     ) -> "Expr":
         """
         Exclude certain columns from a wildcard/regex selection.
@@ -368,11 +375,16 @@ class Expr:
         if isinstance(columns, str):
             columns = [columns]
             return wrap_expr(self._pyexpr.exclude(columns))
-        elif not isinstance(columns, Sequence) and issubclass(columns, DataType):
+        elif not isinstance(columns, Sequence) or isinstance(columns, DataType):
             columns = [columns]
             return wrap_expr(self._pyexpr.exclude_dtype(columns))
 
-        if not all([isinstance(a, str) or issubclass(a, DataType) for a in columns]):
+        if not all(
+            [
+                isinstance(a, str) or (type(a) is type and issubclass(a, DataType))
+                for a in columns
+            ]
+        ):
             raise ValueError("input should be all string or all DataType")
 
         if isinstance(columns[0], str):
@@ -729,7 +741,24 @@ class Expr:
         return wrap_expr(self._pyexpr.agg_groups())
 
     def count(self) -> "Expr":
-        """Count the number of values in this expression"""
+        """
+        Count the number of values in this expression
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"a": [8, 9, 10], "b": [None, 4, 4]})
+        >>> df.select(pl.col("*").count())  # counts nulls
+        shape: (1, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ u32 ┆ u32 │
+        ╞═════╪═════╡
+        │ 3   ┆ 3   │
+        └─────┴─────┘
+
+        """
         return wrap_expr(self._pyexpr.count())
 
     def len(self) -> "Expr":
@@ -756,9 +785,51 @@ class Expr:
             length = pli.lit(length)
         return wrap_expr(self._pyexpr.slice(offset._pyexpr, length._pyexpr))
 
+    def append(self, other: "Expr", upcast: bool = True) -> "Expr":
+        """
+        Append expressions. This is done by adding the chunks of `other` to this `Series`.
+
+        Parameters
+        ----------
+        other
+            Expression to append
+        upcast
+            Cast both `Series` to the same supertype
+        """
+        other = expr_to_lit_or_expr(other)
+        return wrap_expr(self._pyexpr.append(other._pyexpr, upcast))
+
+    def rechunk(self) -> "Expr":
+        """
+        Create a single chunk of memory for this Series.
+        """
+        return wrap_expr(self._pyexpr.rechunk())
+
     def drop_nulls(self) -> "Expr":
         """
-        Drop null values
+        Drop null values.
+
+        Warnings
+        --------
+        NOTE that null values are not floating point NaN values!
+        To drop NaN values, use `drop_nans()`.
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"a": [8, 9, 10], "b": [None, 4, 4]})
+        >>> df.select(pl.col("b").drop_nulls())
+        shape: (2, 1)
+        ┌─────┐
+        │ b   │
+        │ --- │
+        │ i64 │
+        ╞═════╡
+        │ 4   │
+        ├╌╌╌╌╌┤
+        │ 4   │
+        └─────┘
+
         """
         return wrap_expr(self._pyexpr.drop_nulls())
 
@@ -844,7 +915,7 @@ class Expr:
 
     def ceil(self) -> "Expr":
         """
-        Ceil underlying floating point array to the heighest integers smaller or equal to the float value.
+        Ceil underlying floating point array to the highest integers smaller or equal to the float value.
 
         Only works on floating point Series
         """
@@ -934,7 +1005,7 @@ class Expr:
         └─────┴─────┘
 
         """
-        dtype = py_type_to_dtype(dtype)  # type: ignore
+        dtype = py_type_to_dtype(dtype)
         return wrap_expr(self._pyexpr.cast(dtype, strict))
 
     def sort(self, reverse: bool = False, nulls_last: bool = False) -> "Expr":
@@ -1086,6 +1157,27 @@ class Expr:
         ----------
         periods
             Number of places to shift (may be negative).
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"foo": [1, 2, 3, 4]})
+        >>> df.select(pl.col("foo").shift(1))
+        shape: (4, 1)
+        ┌──────┐
+        │ foo  │
+        │ ---  │
+        │ i64  │
+        ╞══════╡
+        │ null │
+        ├╌╌╌╌╌╌┤
+        │ 1    │
+        ├╌╌╌╌╌╌┤
+        │ 2    │
+        ├╌╌╌╌╌╌┤
+        │ 3    │
+        └──────┘
+
         """
         return wrap_expr(self._pyexpr.shift(periods))
 
@@ -1106,7 +1198,11 @@ class Expr:
         fill_value = expr_to_lit_or_expr(fill_value, str_to_lit=True)
         return wrap_expr(self._pyexpr.shift_and_fill(periods, fill_value._pyexpr))
 
-    def fill_null(self, fill_value: Union[int, float, bool, str, "Expr"]) -> "Expr":
+    def fill_null(
+        self,
+        fill_value: Union[int, float, bool, str, "Expr"],
+        limit: Optional[int] = None,
+    ) -> "Expr":
         """
         Fill null values using a filling strategy, literal, or Expr.
 
@@ -1120,6 +1216,8 @@ class Expr:
             - "one"
             - "zero"
             Or an expression.
+        limit
+            if strategy is 'forward' or 'backward', this the number of consecutive null values to forward/backward fill.
 
         Examples
         --------
@@ -1154,7 +1252,7 @@ class Expr:
 
         """
         # we first must check if it is not an expr, as expr does not implement __bool__
-        # and thus leads to a value error in the second comparisson.
+        # and thus leads to a value error in the second comparison.
         if not isinstance(fill_value, Expr) and fill_value in [
             "backward",
             "forward",
@@ -1164,7 +1262,7 @@ class Expr:
             "zero",
             "one",
         ]:
-            return wrap_expr(self._pyexpr.fill_null_with_strategy(fill_value))
+            return wrap_expr(self._pyexpr.fill_null_with_strategy(fill_value, limit))
 
         fill_value = expr_to_lit_or_expr(fill_value, str_to_lit=True)
         return wrap_expr(self._pyexpr.fill_null(fill_value._pyexpr))
@@ -1176,21 +1274,63 @@ class Expr:
         fill_value = expr_to_lit_or_expr(fill_value, str_to_lit=True)
         return wrap_expr(self._pyexpr.fill_nan(fill_value._pyexpr))
 
-    def forward_fill(self) -> "Expr":
+    def forward_fill(self, limit: Optional[int] = None) -> "Expr":
         """
         Fill missing values with the latest seen values
-        """
-        return wrap_expr(self._pyexpr.forward_fill())
 
-    def backward_fill(self) -> "Expr":
+        Parameters
+        ----------
+        limit
+            This the number of consecutive null values to forward/backward fill.
+        """
+        return wrap_expr(self._pyexpr.forward_fill(limit))
+
+    def backward_fill(self, limit: Optional[int] = None) -> "Expr":
         """
         Fill missing values with the next to be seen values
+
+        Parameters
+        ----------
+        limit
+            This the number of consecutive null values to forward/backward fill.
         """
-        return wrap_expr(self._pyexpr.backward_fill())
+        return wrap_expr(self._pyexpr.backward_fill(limit))
 
     def reverse(self) -> "Expr":
         """
         Reverse the selection.
+
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "A": [1, 2, 3, 4, 5],
+        ...         "fruits": ["banana", "banana", "apple", "apple", "banana"],
+        ...         "B": [5, 4, 3, 2, 1],
+        ...         "cars": ["beetle", "audi", "beetle", "beetle", "beetle"],
+        ...     }
+        ... )
+        >>> df.select(
+        ...     [
+        ...         pl.all(),
+        ...         pl.all().reverse().suffix("_reverse"),
+        ...     ]
+        ... )
+        shape: (5, 8)
+        ┌─────┬────────┬─────┬────────┬───────────┬────────────────┬───────────┬──────────────┐
+        │ A   ┆ fruits ┆ B   ┆ cars   ┆ A_reverse ┆ fruits_reverse ┆ B_reverse ┆ cars_reverse │
+        │ --- ┆ ---    ┆ --- ┆ ---    ┆ ---       ┆ ---            ┆ ---       ┆ ---          │
+        │ i64 ┆ str    ┆ i64 ┆ str    ┆ i64       ┆ str            ┆ i64       ┆ str          │
+        ╞═════╪════════╪═════╪════════╪═══════════╪════════════════╪═══════════╪══════════════╡
+        │ 1   ┆ banana ┆ 5   ┆ beetle ┆ 5         ┆ banana         ┆ 1         ┆ beetle       │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 2   ┆ banana ┆ 4   ┆ audi   ┆ 4         ┆ apple          ┆ 2         ┆ beetle       │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 3   ┆ apple  ┆ 3   ┆ beetle ┆ 3         ┆ apple          ┆ 3         ┆ beetle       │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 4   ┆ apple  ┆ 2   ┆ beetle ┆ 2         ┆ banana         ┆ 4         ┆ audi         │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 5   ┆ banana ┆ 1   ┆ beetle ┆ 1         ┆ banana         ┆ 5         ┆ beetle       │
+        └─────┴────────┴─────┴────────┴───────────┴────────────────┴───────────┴──────────────┘
+
         """
         return wrap_expr(self._pyexpr.reverse())
 
@@ -1252,11 +1392,43 @@ class Expr:
         return wrap_expr(self._pyexpr.n_unique())
 
     def null_count(self) -> "Expr":
-        """Count unique values."""
+        """Count null values."""
         return wrap_expr(self._pyexpr.null_count())
 
     def arg_unique(self) -> "Expr":
-        """Get index of first unique value."""
+        """
+        Get index of first unique value.
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"a": [8, 9, 10], "b": [None, 4, 4]})
+        >>> df.select(pl.col("a").arg_unique())
+        shape: (3, 1)
+        ┌─────┐
+        │ a   │
+        │ --- │
+        │ u32 │
+        ╞═════╡
+        │ 0   │
+        ├╌╌╌╌╌┤
+        │ 1   │
+        ├╌╌╌╌╌┤
+        │ 2   │
+        └─────┘
+        >>> df.select(pl.col("b").arg_unique())
+        shape: (2, 1)
+        ┌─────┐
+        │ b   │
+        │ --- │
+        │ u32 │
+        ╞═════╡
+        │ 0   │
+        ├╌╌╌╌╌┤
+        │ 1   │
+        └─────┘
+
+        """
         return wrap_expr(self._pyexpr.arg_unique())
 
     def unique(self, maintain_order: bool = False) -> "Expr":
@@ -1459,7 +1631,7 @@ class Expr:
 
     def map(
         self,
-        f: Callable[["pli.Series"], "pli.Series"],
+        f: Callable[["pli.Series"], Union["pli.Series", Any]],
         return_dtype: Optional[Type[DataType]] = None,
         agg_list: bool = False,
     ) -> "Expr":
@@ -1491,8 +1663,6 @@ class Expr:
         Apply a custom function in a GroupBy or Projection context.
 
         Depending on the context it has the following behavior:
-
-        ## Context
 
         * Select/Project
             expected type `f`: Callable[[Any], Any]
@@ -1557,6 +1727,37 @@ class Expr:
         Returns
         -------
         Exploded Series of same dtype
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"foo": ["hello", "world"]})
+        >>> df.select(pl.col("foo").flatten())
+        shape: (10, 1)
+        ┌─────┐
+        │ foo │
+        │ --- │
+        │ str │
+        ╞═════╡
+        │ h   │
+        ├╌╌╌╌╌┤
+        │ e   │
+        ├╌╌╌╌╌┤
+        │ l   │
+        ├╌╌╌╌╌┤
+        │ l   │
+        ├╌╌╌╌╌┤
+        │ ... │
+        ├╌╌╌╌╌┤
+        │ o   │
+        ├╌╌╌╌╌┤
+        │ r   │
+        ├╌╌╌╌╌┤
+        │ l   │
+        ├╌╌╌╌╌┤
+        │ d   │
+        └─────┘
+
         """
 
         return wrap_expr(self._pyexpr.explode())
@@ -1599,6 +1800,25 @@ class Expr:
     def take_every(self, n: int) -> "Expr":
         """
         Take every nth value in the Series and return as a new Series.
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"foo": [1, 2, 3, 4, 5, 6, 7, 8, 9]})
+        >>> df.select(pl.col("foo").take_every(3))
+        shape: (3, 1)
+        ┌─────┐
+        │ foo │
+        │ --- │
+        │ i64 │
+        ╞═════╡
+        │ 1   │
+        ├╌╌╌╌╌┤
+        │ 4   │
+        ├╌╌╌╌╌┤
+        │ 7   │
+        └─────┘
+
         """
         return wrap_expr(self._pyexpr.take_every(n))
 
@@ -1616,13 +1836,14 @@ class Expr:
         """
         return wrap_expr(self._pyexpr.tail(n))
 
-    def pow(self, exponent: float) -> "Expr":
+    def pow(self, exponent: Union[float, "Expr"]) -> "Expr":
         """
         Raise expression to the power of exponent.
         """
-        return wrap_expr(self._pyexpr.pow(exponent))
+        exponent = expr_to_lit_or_expr(exponent)
+        return wrap_expr(self._pyexpr.pow(exponent._pyexpr))
 
-    def is_in(self, other: Union["Expr", List[Any]]) -> "Expr":
+    def is_in(self, other: Union["Expr", List[Any], str]) -> "Expr":
         """
         Check if elements of this Series are in the right Series, or List values of the right Series.
 
@@ -1781,24 +2002,43 @@ class Expr:
                 "include_bounds should be a boolean or [boolean, boolean]."
             )
 
-    def hash(self, k0: int = 0, k1: int = 1, k2: int = 2, k3: int = 3) -> "Expr":
+    def hash(self, seed: int = 0, **kwargs: Any) -> "Expr":
         """
         Hash the Series.
 
-        The hash value is of type `Datetime`
+        The hash value is of type `UInt64`
 
         Parameters
         ----------
-        k0
+        seed
             seed parameter
-        k1
-            seed parameter
-        k2
-            seed parameter
-        k3
-            seed parameter
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "a": [1, 2, 3],
+        ...     }
+        ... )
+        >>> df.with_column(pl.col("a").hash(0))
+        shape: (3, 1)
+        ┌─────────────────────┐
+        │ a                   │
+        │ ---                 │
+        │ u64                 │
+        ╞═════════════════════╡
+        │ 2818902862237899908 │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 1584708464793912000 │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 8337078092773689561 │
+        └─────────────────────┘
+
         """
-        return wrap_expr(self._pyexpr.hash(k0, k1, k2, k3))
+        # kwargs is for backward compatibility
+        # can be removed later
+        return wrap_expr(self._pyexpr.hash(seed))
 
     def reinterpret(self, signed: bool) -> "Expr":
         """
@@ -1856,10 +2096,12 @@ class Expr:
 
     def rolling_min(
         self,
-        window_size: int,
+        window_size: Union[int, str],
         weights: Optional[List[float]] = None,
         min_periods: Optional[int] = None,
         center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
     ) -> "Expr":
         """
         apply a rolling min (moving min) over the values in this array.
@@ -1870,7 +2112,22 @@ class Expr:
         Parameters
         ----------
         window_size
-            The length of the window.
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
         weights
             An optional slice with the same length as the window that will be multiplied
             elementwise with the values in the window.
@@ -1879,19 +2136,41 @@ class Expr:
             If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
+
         """
-        if min_periods is None:
-            min_periods = window_size
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
         return wrap_expr(
-            self._pyexpr.rolling_min(window_size, weights, min_periods, center)
+            self._pyexpr.rolling_min(
+                window_size, weights, min_periods, center, by, closed
+            )
         )
 
     def rolling_max(
         self,
-        window_size: int,
+        window_size: Union[int, str],
         weights: Optional[List[float]] = None,
         min_periods: Optional[int] = None,
         center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
     ) -> "Expr":
         """
         Apply a rolling max (moving max) over the values in this array.
@@ -1902,7 +2181,22 @@ class Expr:
         Parameters
         ----------
         window_size
-            The length of the window.
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
         weights
             An optional slice with the same length as the window that will be multiplied
             elementwise with the values in the window.
@@ -1911,19 +2205,39 @@ class Expr:
             If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
         """
-        if min_periods is None:
-            min_periods = window_size
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
         return wrap_expr(
-            self._pyexpr.rolling_max(window_size, weights, min_periods, center)
+            self._pyexpr.rolling_max(
+                window_size, weights, min_periods, center, by, closed
+            )
         )
 
     def rolling_mean(
         self,
-        window_size: int,
+        window_size: Union[int, str],
         weights: Optional[List[float]] = None,
         min_periods: Optional[int] = None,
         center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
     ) -> "Expr":
         """
         Apply a rolling mean (moving mean) over the values in this array.
@@ -1934,7 +2248,22 @@ class Expr:
         Parameters
         ----------
         window_size
-            The length of the window.
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
         weights
             An optional slice with the same length as the window that will be multiplied
             elementwise with the values in the window.
@@ -1943,6 +2272,21 @@ class Expr:
             If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
 
         Examples
         --------
@@ -1973,18 +2317,23 @@ class Expr:
         └──────┘
 
         """
-        if min_periods is None:
-            min_periods = window_size
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
         return wrap_expr(
-            self._pyexpr.rolling_mean(window_size, weights, min_periods, center)
+            self._pyexpr.rolling_mean(
+                window_size, weights, min_periods, center, by, closed
+            )
         )
 
     def rolling_sum(
         self,
-        window_size: int,
+        window_size: Union[int, str],
         weights: Optional[List[float]] = None,
         min_periods: Optional[int] = None,
         center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
     ) -> "Expr":
         """
         Apply a rolling sum (moving sum) over the values in this array.
@@ -1995,7 +2344,22 @@ class Expr:
         Parameters
         ----------
         window_size
-            The length of the window.
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
         weights
             An optional slice with the same length of the window that will be multiplied
             elementwise with the values in the window.
@@ -2004,19 +2368,40 @@ class Expr:
             If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
+
         """
-        if min_periods is None:
-            min_periods = window_size
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
         return wrap_expr(
-            self._pyexpr.rolling_sum(window_size, weights, min_periods, center)
+            self._pyexpr.rolling_sum(
+                window_size, weights, min_periods, center, by, closed
+            )
         )
 
     def rolling_std(
         self,
-        window_size: int,
+        window_size: Union[int, str],
         weights: Optional[List[float]] = None,
         min_periods: Optional[int] = None,
         center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
     ) -> "Expr":
         """
         Compute a rolling std dev
@@ -2028,7 +2413,22 @@ class Expr:
         Parameters
         ----------
         window_size
-            The length of the window.
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
         weights
             An optional slice with the same length as the window that will be multiplied
             elementwise with the values in the window.
@@ -2037,19 +2437,40 @@ class Expr:
             If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
+
         """
-        if min_periods is None:
-            min_periods = window_size
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
         return wrap_expr(
-            self._pyexpr.rolling_std(window_size, weights, min_periods, center)
+            self._pyexpr.rolling_std(
+                window_size, weights, min_periods, center, by, closed
+            )
         )
 
     def rolling_var(
         self,
-        window_size: int,
+        window_size: Union[int, str],
         weights: Optional[List[float]] = None,
         min_periods: Optional[int] = None,
         center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
     ) -> "Expr":
         """
         Compute a rolling variance.
@@ -2061,7 +2482,22 @@ class Expr:
         Parameters
         ----------
         window_size
-            The length of the window.
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
         weights
             An optional slice with the same length as the window that will be multiplied
             elementwise with the values in the window.
@@ -2070,11 +2506,173 @@ class Expr:
             If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
+
         """
-        if min_periods is None:
-            min_periods = window_size
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
         return wrap_expr(
-            self._pyexpr.rolling_var(window_size, weights, min_periods, center)
+            self._pyexpr.rolling_var(
+                window_size, weights, min_periods, center, by, closed
+            )
+        )
+
+    def rolling_median(
+        self,
+        window_size: Union[int, str],
+        weights: Optional[List[float]] = None,
+        min_periods: Optional[int] = None,
+        center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
+    ) -> "Expr":
+        """
+        Compute a rolling median
+
+        Parameters
+        ----------
+        window_size
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
+        weights
+            An optional slice with the same length as the window that will be multiplied
+            elementwise with the values in the window.
+        min_periods
+            The number of values in the window that should be non-null before computing a result.
+            If None, it will be set equal to window size.
+        center
+            Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
+
+        """
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
+        return wrap_expr(
+            self._pyexpr.rolling_median(
+                window_size, weights, min_periods, center, by, closed
+            )
+        )
+
+    def rolling_quantile(
+        self,
+        quantile: float,
+        interpolation: str = "nearest",
+        window_size: Union[int, str] = 2,
+        weights: Optional[List[float]] = None,
+        min_periods: Optional[int] = None,
+        center: bool = False,
+        by: Optional[str] = None,
+        closed: str = "left",
+    ) -> "Expr":
+        """
+        Compute a rolling quantile
+
+        Parameters
+        ----------
+        quantile
+            quantile to compute
+        interpolation
+            interpolation type, options: ['nearest', 'higher', 'lower', 'midpoint', 'linear']
+        window_size
+            The length of the window. Can be a fixed integer size, or a dynamic temporal size
+            indicated by the following string language:
+
+            - 1ns   (1 nanosecond)
+            - 1us   (1 microsecond)
+            - 1ms   (1 millisecond)
+            - 1s    (1 second)
+            - 1m    (1 minute)
+            - 1h    (1 hour)
+            - 1d    (1 day)
+            - 1w    (1 week)
+            - 1mo   (1 calendar month)
+            - 1y    (1 calendar year)
+            - 1i    (1 index count)
+
+            If the dynamic string language is used, the `by` and `closed` arguments must also be set.
+        weights
+            An optional slice with the same length as the window that will be multiplied
+            elementwise with the values in the window.
+        min_periods
+            The number of values in the window that should be non-null before computing a result.
+            If None, it will be set equal to window size.
+        center
+            Set the labels at the center of the window
+        by
+            If the `window_size` is temporal for instance `"5h"` or `"3s`, you must
+            set the column that will be used to determine the windows. This column must of dtype
+            `{Date, Datetime}`
+        closed
+            Defines if the temporal window interval is closed or not.
+            Any of {"left", "right", "both" "none"}
+
+        .. warning::
+            The dynamic windows functionality is still experimental and may change without
+            it considered being a breaking change
+
+        .. note::
+            If you want to compute multiple aggregation statistics over the same dynamic window, consider using
+            `groupby_rolling` this method can cache the window size computation.
+
+        """
+        window_size, min_periods = _prepare_rolling_window_args(
+            window_size, min_periods
+        )
+        return wrap_expr(
+            self._pyexpr.rolling_quantile(
+                quantile,
+                interpolation,
+                window_size,
+                weights,
+                min_periods,
+                center,
+                by,
+                closed,
+            )
         )
 
     def rolling_apply(
@@ -2147,72 +2745,6 @@ class Expr:
         return wrap_expr(
             self._pyexpr.rolling_apply(
                 function, window_size, weights, min_periods, center
-            )
-        )
-
-    def rolling_median(
-        self,
-        window_size: int,
-        weights: Optional[List[float]] = None,
-        min_periods: Optional[int] = None,
-        center: bool = False,
-    ) -> "Expr":
-        """
-        Compute a rolling median
-
-        Parameters
-        ----------
-        window_size
-            Size of the rolling window
-        weights
-            An optional slice with the same length as the window that will be multiplied
-            elementwise with the values in the window.
-        min_periods
-            The number of values in the window that should be non-null before computing a result.
-            If None, it will be set equal to window size.
-        center
-            Set the labels at the center of the window
-        """
-        if min_periods is None:
-            min_periods = window_size
-        return wrap_expr(
-            self._pyexpr.rolling_median(window_size, weights, min_periods, center)
-        )
-
-    def rolling_quantile(
-        self,
-        quantile: float,
-        interpolation: str = "nearest",
-        window_size: int = 2,
-        weights: Optional[List[float]] = None,
-        min_periods: Optional[int] = None,
-        center: bool = False,
-    ) -> "Expr":
-        """
-        Compute a rolling quantile
-
-        Parameters
-        ----------
-        quantile
-            quantile to compute
-        interpolation
-            interpolation type, options: ['nearest', 'higher', 'lower', 'midpoint', 'linear']
-        window_size
-            The length of the window.
-        weights
-            An optional slice with the same length as the window that will be multiplied
-            elementwise with the values in the window.
-        min_periods
-            The number of values in the window that should be non-null before computing a result.
-            If None, it will be set equal to window size.
-        center
-            Set the labels at the center of the window
-        """
-        if min_periods is None:
-            min_periods = window_size
-        return wrap_expr(
-            self._pyexpr.rolling_quantile(
-                quantile, interpolation, window_size, weights, min_periods, center
             )
         )
 
@@ -2430,7 +2962,7 @@ class Expr:
 
     def clip(self, min_val: Union[int, float], max_val: Union[int, float]) -> "Expr":
         """
-        Clip (limit) the values in an array to any value that fits in 64 floating poitns range.
+        Clip (limit) the values in an array to any value that fits in 64 floating point range.
 
         Only works for the following dtypes: {Int32, Int64, Float32, Float64, UInt32}.
 
@@ -2460,6 +2992,27 @@ class Expr:
     def sign(self) -> "Expr":
         """
         Returns an element-wise indication of the sign of a number.
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"foo": [-9, -8, 0, 4]})
+        >>> df.select(pl.col("foo").sign())
+        shape: (4, 1)
+        ┌─────┐
+        │ foo │
+        │ --- │
+        │ i64 │
+        ╞═════╡
+        │ -1  │
+        ├╌╌╌╌╌┤
+        │ -1  │
+        ├╌╌╌╌╌┤
+        │ 0   │
+        ├╌╌╌╌╌┤
+        │ 1   │
+        └─────┘
+
         """
         return np.sign(self)  # type: ignore
 
@@ -2625,6 +3178,25 @@ class Expr:
         Returns
         -------
         Expr
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"foo": [1, 2, 3, 4, 5, 6, 7, 8, 9]})
+        >>> df.select(pl.col("foo").reshape((3, 3)))
+        shape: (3, 1)
+        ┌───────────┐
+        │ foo       │
+        │ ---       │
+        │ list[i64] │
+        ╞═══════════╡
+        │ [1, 2, 3] │
+        ├╌╌╌╌╌╌╌╌╌╌╌┤
+        │ [4, 5, 6] │
+        ├╌╌╌╌╌╌╌╌╌╌╌┤
+        │ [7, 8, 9] │
+        └───────────┘
+
         """
         return wrap_expr(self._pyexpr.reshape(dims))
 
@@ -2645,6 +3217,7 @@ class Expr:
         self,
         fraction: float = 1.0,
         with_replacement: bool = True,
+        shuffle: bool = False,
         seed: Optional[int] = None,
     ) -> "Expr":
         """
@@ -2658,8 +3231,12 @@ class Expr:
             Allow values to be sampled more than once.
         seed
             Seed initialization. If None given a random seed is used.
+        shuffle
+            Shuffle the order of sampled data points.
         """
-        return wrap_expr(self._pyexpr.sample_frac(fraction, with_replacement, seed))
+        return wrap_expr(
+            self._pyexpr.sample_frac(fraction, with_replacement, shuffle, seed)
+        )
 
     def ewm_mean(
         self,
@@ -2883,19 +3460,91 @@ class Expr:
         """
         return wrap_expr(self._pyexpr.log(base))
 
-    def entropy(self, base: float = math.e) -> "Expr":
+    def entropy(self, base: float = math.e, normalize: bool = True) -> "Expr":
         """
         Compute the entropy as `-sum(pk * log(pk)`.
         where `pk` are discrete probabilities.
-
-        This routine will normalize pk if they don’t sum to 1.
 
         Parameters
         ----------
         base
             Given base, defaults to `e`
+        normalize
+            Normalize pk if it doesn't sum to 1.
+
         """
-        return wrap_expr(self._pyexpr.entropy(base))
+        return wrap_expr(self._pyexpr.entropy(base, normalize))
+
+    def cumulative_eval(
+        self, expr: "Expr", min_periods: int = 1, parallel: bool = False
+    ) -> "Expr":
+        """
+        Run an expression over a sliding window that increases `1` slot every iteration.
+
+        .. warning::
+            This can be really slow as it can have `O(n^2)` complexity. Don't use this for operations
+            that visit all elements.
+
+        .. warning::
+            This API is experimental and may change without it being considered a breaking change.
+
+        Parameters
+        ----------
+        expr
+            Expression to evaluate
+        min_periods
+            Number of valid values there should be in the window before the expression is evaluated.
+            valid values =  `length - null_count`
+        parallel
+            Run in parallel. Don't do this in a groupby or another operation that already has much parallelization.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame({"values": [1, 2, 3, 4, 5]})
+        >>> df.select(
+        ...     [
+        ...         pl.col("values").cumulative_eval(
+        ...             pl.element().first() - pl.element().last() ** 2
+        ...         )
+        ...     ]
+        ... )
+        shape: (5, 1)
+        ┌────────┐
+        │ values │
+        │ ---    │
+        │ f64    │
+        ╞════════╡
+        │ 0.0    │
+        ├╌╌╌╌╌╌╌╌┤
+        │ -3.0   │
+        ├╌╌╌╌╌╌╌╌┤
+        │ -8.0   │
+        ├╌╌╌╌╌╌╌╌┤
+        │ -15.0  │
+        ├╌╌╌╌╌╌╌╌┤
+        │ -24.0  │
+        └────────┘
+
+        """
+        return wrap_expr(
+            self._pyexpr.cumulative_eval(expr._pyexpr, min_periods, parallel)
+        )
+
+    def set_sorted(self, reverse: bool = False) -> "Expr":
+        """
+        Set this `Series` as `sorted` so that downstream code can use
+        fast paths for sorted arrays.
+
+        .. warning::
+            This can lead to incorrect results if this `Series` is not sorted!!
+            Use with care!
+
+        Parameters
+        ----------
+        reverse
+            If the `Series` order is reversed, e.g. descending.
+        """
+        return self.map(lambda s: s.set_sorted(reverse))
 
     # Below are the namespaces defined. Keep these at the end of the definition of Expr, as to not confuse mypy with
     # the type annotation `str` with the namespace "str"
@@ -3487,6 +4136,52 @@ class ExprListNameSpace:
         """
         return self.slice(-n, n)
 
+    def to_struct(
+        self,
+        n_field_strategy: str = "first_non_null",
+        name_generator: Optional[Callable[[int], str]] = None,
+    ) -> "Expr":
+        """
+        Convert the series of type `List` to a series of type `Struct`.
+
+        Parameters
+        ----------
+        n_field_strategy
+            Strategy to determine the number of fields of the struct.
+            Any of {'first_non_null', 'max_width'}
+        name_generator
+            A custom function that can be used to generate the field names.
+            Default field names are `field_0, field_1 .. field_n`
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame({"a": [[1, 2, 3], [1, 2]]})
+        >>> df.select([pl.col("a").arr.to_struct()])
+        shape: (2, 1)
+        ┌────────────┐
+        │ a          │
+        │ ---        │
+        │ struct[3]  │
+        ╞════════════╡
+        │ {1,2,3}    │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ {1,2,null} │
+        └────────────┘
+        >>> df.select(
+        ...     [
+        ...         pl.col("a").arr.to_struct(
+        ...             name_generator=lambda idx: f"col_name_{idx}"
+        ...         )
+        ...     ]
+        ... ).to_series().to_list()
+        [{'col_name_0': 1, 'col_name_1': 2, 'col_name_2': 3},
+        {'col_name_0': 1, 'col_name_1': 2, 'col_name_2': None}]
+
+        """
+
+        return wrap_expr(self._pyexpr.lst_to_struct(n_field_strategy, name_generator))
+
     def eval(self, expr: "Expr", parallel: bool = False) -> "Expr":
         """
         Run any polars expression against the lists' elements
@@ -3506,7 +4201,7 @@ class ExprListNameSpace:
 
         >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2]})
         >>> df.with_column(
-        ...     pl.concat_list(["a", "b"]).arr.eval(pl.first().rank()).alias("rank")
+        ...     pl.concat_list(["a", "b"]).arr.eval(pl.element().rank()).alias("rank")
         ... )
         shape: (3, 3)
         ┌─────┬─────┬────────────┐
@@ -3535,18 +4230,18 @@ class ExprStringNameSpace:
 
     def strptime(
         self,
-        datatype: Union[Type[Date], Type[Datetime]],
+        datatype: Union[Type[Date], Type[Datetime], Type[Time]],
         fmt: Optional[str] = None,
         strict: bool = True,
         exact: bool = True,
     ) -> Expr:
         """
-        Parse utf8 expression as a Date/Datetimetype.
+        Parse a UTF8 expression to a Date/Datetime/Time type.
 
         Parameters
         ----------
         datatype
-            Date | Datetime.
+            Date | Datetime | Time.
         fmt
             format to use, see the following link for examples:
             https://docs.rs/chrono/latest/chrono/format/strftime/index.html
@@ -3607,9 +4302,11 @@ class ExprStringNameSpace:
             return wrap_expr(self._pyexpr.str_parse_date(fmt, strict, exact))
         elif datatype == Datetime:
             return wrap_expr(self._pyexpr.str_parse_datetime(fmt, strict, exact))
+        elif datatype == Time:
+            return wrap_expr(self._pyexpr.str_parse_time(fmt, strict, exact))
         else:
             raise ValueError(
-                "dtype should be of type {Date, Datetime}"
+                "dtype should be of type {Date, Datetime, Time}"
             )  # pragma: no cover
 
     def lengths(self) -> Expr:
@@ -3674,16 +4371,98 @@ class ExprStringNameSpace:
         """
         return wrap_expr(self._pyexpr.str_rstrip())
 
-    def contains(self, pattern: str) -> Expr:
+    def zfill(self, alignment: int) -> Expr:
         """
-        Check if string contains regex.
+        Return a copy of the string left filled with ASCII '0' digits to make a string of length width.
+        A leading sign prefix ('+'/'-') is handled by inserting the padding after the sign character
+        rather than before.
+        The original string is returned if width is less than or equal to `len(s)`.
+
+        Parameters
+        ----------
+        alignment
+            Fill the value up to this length
+
+        Examples
+        --------
+
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "num": [-10, -1, 0, 1, 10, 100, 1000, 10000, 100000, 1000000, None],
+        ...     }
+        ... )
+        >>> df.with_column(pl.col("num").cast(str).str.zfill(5))
+        shape: (11, 1)
+        ┌─────────┐
+        │ num     │
+        │ ---     │
+        │ str     │
+        ╞═════════╡
+        │ -0010   │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ -0001   │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ 00000   │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ 00001   │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ ...     │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ 10000   │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ 100000  │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ 1000000 │
+        ├╌╌╌╌╌╌╌╌╌┤
+        │ null    │
+        └─────────┘
+
+        """
+        return wrap_expr(self._pyexpr.str_zfill(alignment))
+
+    def ljust(self, width: int, fillchar: str = " ") -> Expr:
+        """
+        Return the string left justified in a string of length width.
+        Padding is done using the specified `fillchar`,
+        The original string is returned if width is less than or equal to `len(s)`.
+
+        Parameters
+        ----------
+        width
+            justify left to this length
+        fillchar
+            fill with this ASCII character
+        """
+        return wrap_expr(self._pyexpr.str_ljust(width, fillchar))
+
+    def rjust(self, width: int, fillchar: str = " ") -> Expr:
+        """
+        Return the string right justified in a string of length width.
+        Padding is done using the specified `fillchar`,
+        The original string is returned if width is less than or equal to `len(s)`.
+
+        Parameters
+        ----------
+        width
+            justify right to this length
+        fillchar
+            fill with this ASCII character
+        """
+        return wrap_expr(self._pyexpr.str_rjust(width, fillchar))
+
+    def contains(self, pattern: str, literal: bool = False) -> Expr:
+        """
+        Check if string contains a substring that matches a regex.
 
         Parameters
         ----------
         pattern
-            Regex pattern.
+            A valid regex pattern.
+        literal
+            Treat pattern as a literal string.
+
         """
-        return wrap_expr(self._pyexpr.str_contains(pattern))
+        return wrap_expr(self._pyexpr.str_contains(pattern, literal))
 
     def json_path_match(self, json_path: str) -> Expr:
         """
@@ -3852,6 +4631,76 @@ class ExprStringNameSpace:
         """
         return wrap_expr(self._pyexpr.str_extract(pattern, group_index))
 
+    def extract_all(self, pattern: str) -> Expr:
+        r"""
+        Extract each successive non-overlapping regex match in an individual string as an array
+
+        Parameters
+        ----------
+        pattern
+            A valid regex pattern
+
+        Returns
+        -------
+        List[Utf8] array. Contain null if original value is null or regex capture nothing.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame({"foo": ["123 bla 45 asd", "xyz 678 910t"]})
+        >>> df.select(
+        ...     [
+        ...         pl.col("foo").str.extract_all(r"(\d+)").alias("extracted_nrs"),
+        ...     ]
+        ... )
+        shape: (2, 1)
+        ┌────────────────┐
+        │ extracted_nrs  │
+        │ ---            │
+        │ list[str]      │
+        ╞════════════════╡
+        │ ["123", "45"]  │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ ["678", "910"] │
+        └────────────────┘
+
+        """
+        return wrap_expr(self._pyexpr.str_extract_all(pattern))
+
+    def count_match(self, pattern: str) -> Expr:
+        r"""
+        Count all successive non-overlapping regex matches.
+
+        Parameters
+        ----------
+        pattern
+            A valid regex pattern
+
+        Returns
+        -------
+        UInt32 array. Contain null if original value is null or regex capture nothing.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame({"foo": ["123 bla 45 asd", "xyz 678 910t"]})
+        >>> df.select(
+        ...     [
+        ...         pl.col("foo").str.count_match(r"\d").alias("count_digits"),
+        ...     ]
+        ... )
+        shape: (2, 1)
+        ┌──────────────┐
+        │ count_digits │
+        │ ---          │
+        │ u32          │
+        ╞══════════════╡
+        │ 5            │
+        ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+        │ 6            │
+        └──────────────┘
+
+        """
+        return wrap_expr(self._pyexpr.count_match(pattern))
+
     def split(self, by: str, inclusive: bool = False) -> Expr:
         """
         Split the string by a substring.
@@ -3944,6 +4793,10 @@ class ExprStringNameSpace:
         value
             Replacement string.
 
+        See Also
+        --------
+        replace_all : Replace substring on all regex pattern matches.
+
         Examples
         --------
 
@@ -3973,6 +4826,25 @@ class ExprStringNameSpace:
             Regex pattern.
         value
             Replacement string.
+
+        See Also
+        --------
+        replace : Replace first regex match with a string value.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame({"id": [1, 2], "text": ["abcabc", "123a123"]})
+        >>> df.with_column(pl.col("text").str.replace_all("a", "-"))
+        shape: (2, 2)
+        ┌─────┬─────────┐
+        │ id  ┆ text    │
+        │ --- ┆ ---     │
+        │ i64 ┆ str     │
+        ╞═════╪═════════╡
+        │ 1   ┆ -bc-bc  │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
+        │ 2   ┆ 123-123 │
+        └─────┴─────────┘
         """
         return wrap_expr(self._pyexpr.str_replace_all(pattern, value))
 
@@ -4008,9 +4880,6 @@ class ExprDateTimeNameSpace:
         offset: Optional[Union[str, timedelta]] = None,
     ) -> Expr:
         """
-        .. warning::
-            This API is experimental and may change without it being considered a breaking change.
-
         Divide the date/ datetime range into buckets.
         Data must be sorted, if not the output does not make sense.
 
@@ -4473,7 +5342,23 @@ class ExprDateTimeNameSpace:
 
 
 def expr_to_lit_or_expr(
-    expr: Union[Expr, bool, int, float, str, "pli.Series"],
+    expr: Union[
+        Expr,
+        bool,
+        int,
+        float,
+        str,
+        "pli.Series",
+        None,
+        Sequence[
+            Union[
+                int,
+                float,
+                str,
+                None,
+            ]
+        ],
+    ],
     str_to_lit: bool = True,
 ) -> Expr:
     """
@@ -4499,6 +5384,8 @@ def expr_to_lit_or_expr(
         return pli.lit(expr)
     elif isinstance(expr, Expr):
         return expr
+    elif isinstance(expr, list):
+        return pli.lit(pli.Series("", [expr]))
     else:
         raise ValueError(
             f"did not expect value {expr} of type {type(expr)}, maybe disambiguate with pl.lit or pl.col"
@@ -4574,3 +5461,16 @@ def _prepare_alpha(
     if alpha is None:
         raise ValueError("at least one of {com, span, half_life, alpha} should be set")
     return alpha
+
+
+def _prepare_rolling_window_args(
+    window_size: Union[int, str],
+    min_periods: Optional[int] = None,
+) -> Tuple[str, int]:
+    if isinstance(window_size, int):
+        if min_periods is None:
+            min_periods = window_size
+        window_size = f"{window_size}i"
+    if min_periods is None:
+        min_periods = 1
+    return (window_size, min_periods)

@@ -104,6 +104,7 @@ Computations
     Series.cummin
     Series.cummax
     Series.cumprod
+    Series.cumulative_eval
     Series.arg_true
     Series.arg_unique
     Series.unique
@@ -197,6 +198,7 @@ Various
     Series.str
     Series.reinterpret
     Series.to_physical
+    Series.set_sorted
 
 TimeSeries
 ----------
@@ -257,6 +259,8 @@ The following methods are available under the `Series.str` attribute.
     StringNameSpace.contains
     StringNameSpace.json_path_match
     StringNameSpace.extract
+    StringNameSpace.extract_all
+    StringNameSpace.count_match
     StringNameSpace.split
     StringNameSpace.split_exact
     StringNameSpace.replace
@@ -266,6 +270,9 @@ The following methods are available under the `Series.str` attribute.
     StringNameSpace.strip
     StringNameSpace.rstrip
     StringNameSpace.lstrip
+    StringNameSpace.zfill
+    StringNameSpace.ljust
+    StringNameSpace.rjust
     StringNameSpace.slice
     StringNameSpace.encode
     StringNameSpace.decode

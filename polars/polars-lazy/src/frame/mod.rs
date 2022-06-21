@@ -5,6 +5,12 @@ mod csv;
 mod ipc;
 #[cfg(feature = "parquet")]
 mod parquet;
+#[cfg(feature = "python")]
+mod python;
+
+mod anonymous_scan;
+
+pub use anonymous_scan::*;
 
 #[cfg(feature = "csv-file")]
 pub use csv::*;
@@ -42,6 +48,7 @@ use crate::prelude::{
 };
 
 use crate::logical_plan::FETCH_ROWS;
+use crate::prelude::delay_rechunk::DelayRechunk;
 use crate::utils::{combine_predicates_expr, expr_to_root_column_names};
 use polars_arrow::prelude::QuantileInterpolOptions;
 use polars_core::frame::explode::MeltArgs;
@@ -160,6 +167,27 @@ impl LazyFrame {
         let mut lp_arena = Arena::with_capacity(32);
         let root = to_alp(self.logical_plan, &mut expr_arena, &mut lp_arena).unwrap();
         (root, expr_arena, lp_arena)
+    }
+
+    /// Set allowed optimizations
+    pub fn with_optimizations(mut self, opt_state: OptState) -> Self {
+        self.opt_state = opt_state;
+        self
+    }
+
+    /// Turn off all optimizations
+    pub fn without_optimizations(self) -> Self {
+        self.with_optimizations(OptState {
+            projection_pushdown: false,
+            predicate_pushdown: false,
+            type_coercion: true,
+            simplify_expr: false,
+            global_string_cache: false,
+            slice_pushdown: false,
+            // will be toggled by a scan operation such as csv scan or parquet scan
+            agg_scan_projection: false,
+            aggregate_pushdown: false,
+        })
     }
 
     /// Toggle projection pushdown optimization.
@@ -289,7 +317,20 @@ impl LazyFrame {
         self.select_local(vec![col("*").reverse()])
     }
 
-    fn rename_impl_swapping(self, existing: Vec<String>, new: Vec<String>) -> Self {
+    fn rename_impl_swapping(self, mut existing: Vec<String>, mut new: Vec<String>) -> Self {
+        assert_eq!(new.len(), existing.len());
+        let mut removed = 0;
+        for mut idx in 0..existing.len() {
+            // remove "name" -> "name
+            // these are no ops.
+            idx -= removed;
+            if existing[idx] == new[idx] {
+                existing.swap_remove(idx);
+                new.swap_remove(idx);
+                removed += 1;
+            }
+        }
+
         // schema after renaming
         let mut new_schema = (&*self.schema()).clone();
 
@@ -499,11 +540,6 @@ impl LazyFrame {
         let opt = StackOptimizer {};
         let mut rules: Vec<Box<dyn OptimizationRule>> = Vec::with_capacity(8);
 
-        if simplify_expr {
-            rules.push(Box::new(SimplifyExprRule {}));
-            rules.push(Box::new(SimplifyBooleanRule {}));
-        }
-
         // during debug we check if the optimizations have not modified the final schema
         #[cfg(debug_assertions)]
         let prev_schema = logical_plan.schema().clone();
@@ -514,6 +550,11 @@ impl LazyFrame {
         // run that first
         // this optimization will run twice because optimizer may create dumb expressions
         lp_top = opt.optimize_loop(&mut rules, expr_arena, lp_arena, lp_top);
+
+        // we do simplification
+        if simplify_expr {
+            rules.push(Box::new(SimplifyExprRule {}));
+        }
 
         if projection_pushdown {
             let projection_pushdown_opt = ProjectionPushDown {};
@@ -534,6 +575,7 @@ impl LazyFrame {
         }
         // make sure its before slice pushdown.
         rules.push(Box::new(FastProjection {}));
+        rules.push(Box::new(DelayRechunk {}));
 
         if slice_pushdown {
             let slice_pushdown_opt = SlicePushDown {};
@@ -550,6 +592,11 @@ impl LazyFrame {
 
         if type_coercion {
             rules.push(Box::new(TypeCoercionRule {}))
+        }
+        // this optimization removes branches, so we must do it when type coercion
+        // is completed
+        if simplify_expr {
+            rules.push(Box::new(SimplifyBooleanRule {}));
         }
 
         if aggregate_pushdown {
@@ -714,12 +761,17 @@ impl LazyFrame {
     ///        ])
     /// }
     /// ```
-    pub fn groupby<E: AsRef<[Expr]>>(self, by: E) -> LazyGroupBy {
+    pub fn groupby<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(self, by: E) -> LazyGroupBy {
+        let keys = by
+            .as_ref()
+            .iter()
+            .map(|e| e.clone().into())
+            .collect::<Vec<_>>();
         let opt_state = self.get_opt_state();
         LazyGroupBy {
             logical_plan: self.logical_plan,
             opt_state,
-            keys: by.as_ref().to_vec(),
+            keys,
             maintain_order: false,
             dynamic_options: None,
             rolling_options: None,
@@ -759,12 +811,17 @@ impl LazyFrame {
     }
 
     /// Similar to groupby, but order of the DataFrame is maintained.
-    pub fn groupby_stable<E: AsRef<[Expr]>>(self, by: E) -> LazyGroupBy {
+    pub fn groupby_stable<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(self, by: E) -> LazyGroupBy {
+        let keys = by
+            .as_ref()
+            .iter()
+            .map(|e| e.clone().into())
+            .collect::<Vec<_>>();
         let opt_state = self.get_opt_state();
         LazyGroupBy {
             logical_plan: self.logical_plan,
             opt_state,
-            keys: by.as_ref().to_vec(),
+            keys,
             maintain_order: true,
             dynamic_options: None,
             rolling_options: None,
@@ -945,8 +1002,12 @@ impl LazyFrame {
     }
 
     /// Apply explode operation. [See eager explode](polars_core::frame::DataFrame::explode).
-    pub fn explode<E: AsRef<[Expr]>>(self, columns: E) -> LazyFrame {
-        let columns = columns.as_ref().to_vec();
+    pub fn explode<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(self, columns: E) -> LazyFrame {
+        let columns = columns
+            .as_ref()
+            .iter()
+            .map(|e| e.clone().into())
+            .collect::<Vec<_>>();
         let opt_state = self.get_opt_state();
         let lp = self.get_plan_builder().explode(columns).build();
         Self::from_logical_plan(lp, opt_state)
@@ -1070,6 +1131,7 @@ impl LazyFrame {
     /// This can have a negative effect on query performance.
     /// This may for instance block predicate pushdown optimization.
     pub fn with_row_count(mut self, name: &str, offset: Option<IdxSize>) -> LazyFrame {
+        let mut add_row_count_in_map = false;
         match &mut self.logical_plan {
             // Do the row count at scan
             #[cfg(feature = "csv-file")]
@@ -1078,7 +1140,6 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
-                self
             }
             #[cfg(feature = "ipc")]
             LogicalPlan::IpcScan { options, .. } => {
@@ -1086,7 +1147,6 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
-                self
             }
             #[cfg(feature = "parquet")]
             LogicalPlan::ParquetScan { options, .. } => {
@@ -1094,28 +1154,41 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
-                self
             }
             _ => {
-                let new_schema = self
-                    .schema()
-                    .insert_index(0, name.to_string(), IDX_DTYPE)
-                    .unwrap();
-                let name = name.to_owned();
-
-                let opt = AllowedOptimizations {
-                    slice_pushdown: false,
-                    predicate_pushdown: false,
-                    ..Default::default()
-                };
-                self.map(
-                    move |df: DataFrame| df.with_row_count(&name, offset),
-                    Some(opt),
-                    Some(new_schema),
-                    Some("WITH ROW COUNT"),
-                )
+                add_row_count_in_map = true;
             }
         }
+
+        let new_schema = self
+            .schema()
+            .insert_index(0, name.to_string(), IDX_DTYPE)
+            .unwrap();
+        let name = name.to_owned();
+
+        // if we do the row count at scan we add a dummy map, to update the schema
+        let opt = if add_row_count_in_map {
+            AllowedOptimizations {
+                slice_pushdown: false,
+                predicate_pushdown: false,
+                ..Default::default()
+            }
+        } else {
+            AllowedOptimizations::default()
+        };
+
+        self.map(
+            move |df: DataFrame| {
+                if add_row_count_in_map {
+                    df.with_row_count(&name, offset)
+                } else {
+                    Ok(df)
+                }
+            },
+            Some(opt),
+            Some(new_schema),
+            Some("WITH ROW COUNT"),
+        )
     }
 
     /// Unnest the given `Struct` columns. This means that the fields of the `Struct` type will be

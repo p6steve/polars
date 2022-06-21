@@ -35,7 +35,7 @@ def test_to_from_buffer(df: pl.DataFrame, compressions: List[str]) -> None:
             df.write_parquet(buf, compression=compression)
             buf.seek(0)
             read_df = pl.read_parquet(buf)
-            assert df.frame_equal(read_df)
+            assert df.frame_equal(read_df, null_equal=True)
 
 
 def test_to_from_file(
@@ -146,3 +146,9 @@ def test_nested_parquet() -> None:
     assert read.columns == ["a"]
     assert isinstance(read.dtypes[0], pl.datatypes.List)
     assert isinstance(read.dtypes[0].inner, pl.datatypes.Struct)
+
+
+def test_glob_parquet(io_test_dir: str) -> None:
+    path = os.path.join(io_test_dir, "small*.parquet")
+    assert pl.read_parquet(path).shape == (3, 16)
+    assert pl.scan_parquet(path).collect().shape == (3, 16)

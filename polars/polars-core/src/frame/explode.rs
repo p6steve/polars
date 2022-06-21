@@ -1,7 +1,6 @@
 use crate::chunked_array::ops::explode::offsets_to_indexes;
 use crate::prelude::*;
 use crate::utils::get_supertype;
-use arrow::bitmap::{Bitmap, MutableBitmap};
 use arrow::buffer::Buffer;
 use polars_arrow::kernels::concatenate::concatenate_owned_unchecked;
 #[cfg(feature = "serde")]
@@ -29,8 +28,12 @@ pub struct MeltArgs {
 
 impl DataFrame {
     pub fn explode_impl(&self, mut columns: Vec<Series>) -> Result<DataFrame> {
+        let mut df = self.clone();
         if self.height() == 0 {
-            return Ok(self.clone());
+            for s in &columns {
+                df.with_column(s.explode()?)?;
+            }
+            return Ok(df);
         }
         columns.sort_by(|sa, sb| {
             self.check_name_to_idx(sa.name())
@@ -38,52 +41,6 @@ impl DataFrame {
                 .partial_cmp(&self.check_name_to_idx(sb.name()).expect("checked above"))
                 .expect("cmp usize -> Ordering")
         });
-
-        let mut df = self.clone();
-
-        // TODO: optimize this.
-        // This is the slower easier option.
-        // instead of filtering the whole dataframe first
-        // drop empty list rows
-        for col in &mut columns {
-            if let Ok(ca) = col.list() {
-                if !ca.can_fast_explode() {
-                    let (_, offsets) = get_exploded(col)?;
-                    if offsets.is_empty() {
-                        return Ok(self.slice(0, 0));
-                    }
-
-                    let mut mask = MutableBitmap::from_len_set(offsets.len() - 1);
-
-                    let mut latest = offsets[0];
-                    for (i, &o) in (&offsets[1..]).iter().enumerate() {
-                        if o == latest {
-                            unsafe { mask.set_bit_unchecked(i, false) }
-                        }
-                        latest = o;
-                    }
-
-                    let mask = Bitmap::from(mask);
-                    // all lists are empty we return an an empty dataframe with the same schema
-                    if mask.null_count() == mask.len() {
-                        return Ok(self.slice(0, 0));
-                    }
-
-                    let idx = self.check_name_to_idx(col.name())?;
-                    df = df.filter(&BooleanChunked::from_chunks(
-                        "",
-                        vec![Arc::new(BooleanArray::from_data_default(mask, None))],
-                    ))?;
-                    *col = df[idx].clone();
-                    let ca = col
-                        .get_inner_mut()
-                        .as_any_mut()
-                        .downcast_mut::<ListChunked>()
-                        .unwrap();
-                    ca.set_fast_explode();
-                }
-            }
-        }
 
         // first remove all the exploded columns
         for s in &columns {
@@ -99,7 +56,9 @@ impl DataFrame {
                 // expand all the other columns based the exploded first column
                 if i == 0 {
                     let row_idx = offsets_to_indexes(&offsets, exploded.len());
-                    let row_idx = IdxCa::from_vec("", row_idx);
+                    let mut row_idx = IdxCa::from_vec("", row_idx);
+                    row_idx.set_sorted(false);
+
                     // Safety
                     // We just created indices that are in bounds.
                     df = unsafe { df.take_unchecked(&row_idx) };
@@ -330,7 +289,7 @@ impl DataFrame {
         let values =
             unsafe { Series::from_chunks_and_dtype_unchecked(value_name, vec![values_arr], &st) };
 
-        let variable_col = variable_col.into_arc();
+        let variable_col = variable_col.as_box();
         // Safety
         // The give dtype is correct
         let variables = unsafe {
@@ -396,12 +355,22 @@ mod test {
 
         let out = df.explode(["foo"])?;
         let expected = df![
-            "foo" => [1, 2, 3, 1, 1, 1],
-            "B" => [1, 1, 1, 2, 2, 2],
-            "C" => [1, 1, 1, 1, 1, 1],
+            "foo" => [Some(1), Some(2), Some(3), Some(1), Some(1), Some(1), None],
+            "B" => [1, 1, 1, 2, 2, 2, 3],
+            "C" => [1, 1, 1, 1, 1, 1, 1],
         ]?;
 
-        assert!(out.frame_equal(&expected));
+        assert!(out.frame_equal_missing(&expected));
+
+        let list = Series::new("foo", &[s0.clone(), s1.slice(0, 0), s1.clone()]);
+        let df = DataFrame::new(vec![list, s0.clone(), s1.clone()])?;
+        let out = df.explode(["foo"])?;
+        let expected = df![
+            "foo" => [Some(1), Some(2), Some(3), None, Some(1), Some(1), Some(1)],
+            "B" => [1, 1, 1, 2, 2, 2, 3],
+            "C" => [1, 1, 1, 1, 1, 1, 1],
+        ]?;
+        assert!(out.frame_equal_missing(&expected));
         Ok(())
     }
 

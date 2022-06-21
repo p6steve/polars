@@ -92,7 +92,7 @@ impl DataFrame {
         groups: &GroupsProxy,
     ) -> Result<(Vec<IdxSize>, Series)> {
         let column_s = self.column(column)?;
-        let column_agg = column_s.agg_first(groups);
+        let column_agg = unsafe { column_s.agg_first(groups) };
         let column_agg_physical = column_agg.to_physical_repr();
 
         let mut col_to_idx = PlHashMap::with_capacity(HASHMAP_INIT_SIZE);
@@ -121,7 +121,7 @@ impl DataFrame {
     ) -> Result<(Vec<IdxSize>, usize, Option<Vec<Series>>)> {
         let (row_locations, n_rows, row_index) = if index.len() == 1 {
             let index_s = self.column(&index[0])?;
-            let index_agg = index_s.agg_first(groups);
+            let index_agg = unsafe { index_s.agg_first(groups) };
             let index_agg_physical = index_agg.to_physical_repr();
 
             let mut row_to_idx =
@@ -140,10 +140,15 @@ impl DataFrame {
                 .collect::<Vec<_>>();
 
             let row_index = match count {
-                0 => Some(vec![Series::new(
-                    &index[0],
-                    row_to_idx.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                )]),
+                0 => {
+                    let s = Series::new(
+                        &index[0],
+                        row_to_idx.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                    );
+                    // restore logical type
+                    let s = s.cast(index_s.dtype()).unwrap();
+                    Some(vec![s])
+                }
                 _ => None,
             };
 
@@ -152,7 +157,7 @@ impl DataFrame {
             let index_s = self.columns(index)?;
             let index_agg_physical = index_s
                 .iter()
-                .map(|s| s.agg_first(groups).to_physical_repr().into_owned())
+                .map(|s| unsafe { s.agg_first(groups).to_physical_repr().into_owned() })
                 .collect::<Vec<_>>();
             let mut iters = index_agg_physical
                 .iter()
@@ -186,7 +191,7 @@ impl DataFrame {
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
-                            Series::new(
+                            let s = Series::new(
                                 name,
                                 row_to_idx
                                     .iter()
@@ -195,7 +200,9 @@ impl DataFrame {
                                         unsafe { k.get_unchecked(i).clone() }
                                     })
                                     .collect::<Vec<_>>(),
-                            )
+                            );
+                            // restore logical type
+                            s.cast(index_s[i].dtype()).unwrap()
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -222,6 +229,12 @@ impl DataFrame {
         sort_columns: bool,
         stable: bool,
     ) -> Result<DataFrame> {
+        if index.is_empty() {
+            return Err(PolarsError::ComputeError(
+                "index cannot be zero length".into(),
+            ));
+        }
+
         let mut final_cols = vec![];
 
         let mut count = 0;
@@ -248,15 +261,17 @@ impl DataFrame {
                     let value_col = self.column(value_col)?;
 
                     use PivotAgg::*;
-                    let value_agg = match agg_fn {
-                        Sum => value_col.agg_sum(&groups),
-                        Min => value_col.agg_min(&groups),
-                        Max => value_col.agg_max(&groups),
-                        Last => value_col.agg_last(&groups),
-                        First => value_col.agg_first(&groups),
-                        Mean => value_col.agg_mean(&groups),
-                        Median => value_col.agg_median(&groups),
-                        Count => groups.group_count().into_series(),
+                    let value_agg = unsafe {
+                        match agg_fn {
+                            Sum => value_col.agg_sum(&groups),
+                            Min => value_col.agg_min(&groups),
+                            Max => value_col.agg_max(&groups),
+                            Last => value_col.agg_last(&groups),
+                            First => value_col.agg_first(&groups),
+                            Mean => value_col.agg_mean(&groups),
+                            Median => value_col.agg_median(&groups),
+                            Count => groups.group_count().into_series(),
+                        }
                     };
 
                     let headers = column_agg.unique_stable()?.cast(&DataType::Utf8)?;

@@ -36,7 +36,7 @@ impl GroupByExec {
 }
 
 pub(super) fn groupby_helper(
-    df: DataFrame,
+    mut df: DataFrame,
     keys: Vec<Series>,
     aggs: &[Arc<dyn PhysicalExpr>],
     apply: Option<&Arc<dyn DataFrameUdf>>,
@@ -44,6 +44,7 @@ pub(super) fn groupby_helper(
     maintain_order: bool,
     slice: Option<(i64, usize)>,
 ) -> Result<DataFrame> {
+    df.as_single_chunk_par();
     let gb = df.groupby_with_series(keys, true, maintain_order)?;
 
     if let Some(f) = apply {
@@ -68,7 +69,7 @@ pub(super) fn groupby_helper(
         let get_agg = || aggs
             .par_iter()
             .map(|expr| {
-                let agg = as_aggregated(expr.as_ref(), &df, groups, state)?;
+                let agg = expr.evaluate_on_groups(&df, groups, state)?.finalize();
                 if agg.len() != groups.len() {
                     return Err(PolarsError::ComputeError(
                         format!("returned aggregation is a different length: {} than the group lengths: {}",

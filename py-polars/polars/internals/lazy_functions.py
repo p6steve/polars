@@ -11,7 +11,14 @@ else:
 import numpy as np
 
 from polars import internals as pli
-from polars.datatypes import DataType, Date, Datetime, Duration, py_type_to_dtype
+from polars.datatypes import (
+    DataType,
+    Date,
+    Datetime,
+    Duration,
+    PolarsDataType,
+    py_type_to_dtype,
+)
 from polars.utils import (
     _datetime_to_pl_timestamp,
     _timedelta_to_pl_timedelta,
@@ -50,7 +57,13 @@ except ImportError:  # pragma: no cover
 
 
 def col(
-    name: Union[str, List[str], List[Type[DataType]], "pli.Series", Type[DataType]]
+    name: Union[
+        str,
+        List[str],
+        Sequence[PolarsDataType],
+        "pli.Series",
+        PolarsDataType,
+    ]
 ) -> "pli.Expr":
     """
     A column in a DataFrame.
@@ -151,14 +164,71 @@ def col(
     if isclass(name) and issubclass(cast(type, name), DataType):
         name = [cast(type, name)]
 
+    if isinstance(name, DataType):
+        return pli.wrap_expr(_dtype_cols([name]))
+
     if isinstance(name, list):
         if len(name) == 0 or isinstance(name[0], str):
             return pli.wrap_expr(pycols(name))
-        elif isclass(name[0]) and issubclass(name[0], DataType):
+        elif (
+            isclass(name[0])
+            and issubclass(name[0], DataType)
+            or isinstance(name[0], DataType)
+        ):
             return pli.wrap_expr(_dtype_cols(name))
         else:
             raise ValueError("did expect argument of List[str] or List[DataType]")
     return pli.wrap_expr(pycol(name))
+
+
+def element() -> "pli.Expr":
+    """
+    Alias for an element in evaluated in an `eval` expression
+
+    Examples
+    --------
+
+    A horizontal rank computation by taking the elements of a list
+
+    >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2]})
+    >>> df.with_column(
+    ...     pl.concat_list(["a", "b"]).arr.eval(pl.element().rank()).alias("rank")
+    ... )
+    shape: (3, 3)
+    ┌─────┬─────┬────────────┐
+    │ a   ┆ b   ┆ rank       │
+    │ --- ┆ --- ┆ ---        │
+    │ i64 ┆ i64 ┆ list [f32] │
+    ╞═════╪═════╪════════════╡
+    │ 1   ┆ 4   ┆ [1.0, 2.0] │
+    ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
+    │ 8   ┆ 5   ┆ [2.0, 1.0] │
+    ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┤
+    │ 3   ┆ 2   ┆ [2.0, 1.0] │
+    └─────┴─────┴────────────┘
+
+    A mathematical operation on array elements
+
+    >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2]})
+    >>> df.with_column(
+    ...     pl.concat_list(["a", "b"]).arr.eval(pl.element() * 2).alias("a_b_doubled")
+    ... )
+    shape: (3, 3)
+    ┌─────┬─────┬─────────────┐
+    │ a   ┆ b   ┆ a_b_doubled │
+    │ --- ┆ --- ┆ ---         │
+    │ i64 ┆ i64 ┆ list[i64]   │
+    ╞═════╪═════╪═════════════╡
+    │ 1   ┆ 4   ┆ [2, 8]      │
+    ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+    │ 8   ┆ 5   ┆ [16, 10]    │
+    ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+    │ 3   ┆ 2   ┆ [6, 4]      │
+    └─────┴─────┴─────────────┘
+
+    """
+
+    return col("")
 
 
 @overload
@@ -785,7 +855,7 @@ def map_binary(
 
 
 def fold(
-    acc: "pli.Expr",
+    acc: "pli.IntoExpr",
     f: Callable[["pli.Series", "pli.Series"], "pli.Series"],
     exprs: Union[Sequence[Union["pli.Expr", str]], "pli.Expr"],
 ) -> "pli.Expr":
@@ -1424,7 +1494,9 @@ def select(
 
 @overload
 def struct(
-    exprs: Union[Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr"],
+    exprs: Union[
+        Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr", "pli.Series"
+    ],
     eager: Literal[True],
 ) -> "pli.Series":
     ...
@@ -1432,7 +1504,9 @@ def struct(
 
 @overload
 def struct(
-    exprs: Union[Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr"],
+    exprs: Union[
+        Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr", "pli.Series"
+    ],
     eager: Literal[False],
 ) -> "pli.Expr":
     ...
@@ -1440,14 +1514,18 @@ def struct(
 
 @overload
 def struct(
-    exprs: Union[Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr"],
+    exprs: Union[
+        Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr", "pli.Series"
+    ],
     eager: bool = False,
 ) -> Union["pli.Expr", "pli.Series"]:
     ...
 
 
 def struct(
-    exprs: Union[Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr"],
+    exprs: Union[
+        Sequence[Union["pli.Expr", str, "pli.Series"]], "pli.Expr", "pli.Series"
+    ],
     eager: bool = False,
 ) -> Union["pli.Expr", "pli.Series"]:
     """

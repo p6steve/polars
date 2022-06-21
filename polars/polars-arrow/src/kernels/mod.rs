@@ -7,6 +7,8 @@ pub mod float;
 pub mod list;
 pub mod rolling;
 pub mod set;
+pub mod sort_partition;
+pub mod sorted_join;
 #[cfg(feature = "strings")]
 pub mod string;
 pub mod take;
@@ -19,7 +21,7 @@ enum State {
     Bits(u64),
     // it is iterating over chunks (steps of size of 64 slots)
     Chunks,
-    // it is iterating over the remainding bits (steps of size of 1 slot)
+    // it is iterating over the remaining bits (steps of size of 1 slot)
     Remainder,
     // nothing more to iterate.
     Finish,

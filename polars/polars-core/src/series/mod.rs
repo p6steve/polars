@@ -1,10 +1,6 @@
 //! Type agnostic columnar data structure.
 pub use crate::prelude::ChunkCompare;
 use crate::prelude::*;
-use arrow::array::ArrayRef;
-use polars_arrow::prelude::QuantileInterpolOptions;
-#[cfg(any(feature = "dtype-struct", feature = "object"))]
-use std::any::Any;
 
 mod any_value;
 pub(crate) mod arithmetic;
@@ -18,12 +14,13 @@ mod series_trait;
 #[cfg(feature = "private")]
 pub mod unstable;
 
-use crate::chunked_array::ops::rolling_window::RollingOptions;
 #[cfg(feature = "rank")]
 use crate::prelude::unique::rank::rank;
+#[cfg(feature = "zip_with")]
+use crate::series::arithmetic::coerce_lhs_rhs;
 use crate::utils::{split_ca, split_series};
 use crate::utils::{split_offsets, Wrap};
-use crate::{series::arithmetic::coerce_lhs_rhs, POOL};
+use crate::POOL;
 use ahash::RandomState;
 use arrow::compute::aggregate::estimated_bytes_size;
 pub use from::*;
@@ -35,6 +32,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
 
+pub use iterator::SeriesIter;
 pub use series_trait::IsSorted;
 
 /// # Series
@@ -159,11 +157,18 @@ impl Series {
         Series::full_null(name, 0, dtype)
     }
 
-    pub(crate) fn get_inner_mut(&mut self) -> &mut dyn SeriesTrait {
+    #[doc(hidden)]
+    #[cfg(feature = "private")]
+    pub fn _get_inner_mut(&mut self) -> &mut dyn SeriesTrait {
         if Arc::weak_count(&self.0) + Arc::strong_count(&self.0) != 1 {
             self.0 = self.0.clone_inner();
         }
         Arc::get_mut(&mut self.0).expect("implementation error")
+    }
+
+    pub fn set_sorted(&mut self, _reverse: bool) {
+        let inner = self._get_inner_mut();
+        inner._set_sorted(_reverse)
     }
 
     pub fn into_frame(self) -> DataFrame {
@@ -172,18 +177,18 @@ impl Series {
 
     /// Rename series.
     pub fn rename(&mut self, name: &str) -> &mut Series {
-        self.get_inner_mut().rename(name);
+        self._get_inner_mut().rename(name);
         self
     }
 
     /// Shrink the capacity of this array to fit it's length.
     pub fn shrink_to_fit(&mut self) {
-        self.get_inner_mut().shrink_to_fit()
+        self._get_inner_mut().shrink_to_fit()
     }
 
     /// Append arrow array of same datatype.
     pub fn append_array(&mut self, other: ArrayRef) -> Result<&mut Self> {
-        self.get_inner_mut().append_array(other)?;
+        self._get_inner_mut().append_array(other)?;
         Ok(self)
     }
 
@@ -191,7 +196,7 @@ impl Series {
     ///
     /// See [`ChunkedArray::append`] and [`ChunkedArray::extend`].
     pub fn append(&mut self, other: &Series) -> Result<&mut Self> {
-        self.get_inner_mut().append(other)?;
+        self._get_inner_mut().append(other)?;
         Ok(self)
     }
 
@@ -199,7 +204,7 @@ impl Series {
     ///
     /// See [`ChunkedArray::extend`] and [`ChunkedArray::append`].
     pub fn extend(&mut self, other: &Series) -> Result<&mut Self> {
-        self.get_inner_mut().extend(other)?;
+        self._get_inner_mut().extend(other)?;
         Ok(self)
     }
 
@@ -212,7 +217,7 @@ impl Series {
 
     /// Only implemented for numeric types
     pub fn as_single_ptr(&mut self) -> Result<usize> {
-        self.get_inner_mut().as_single_ptr()
+        self._get_inner_mut().as_single_ptr()
     }
 
     /// Cast `[Series]` to another `[DataType]`
@@ -418,11 +423,12 @@ impl Series {
     pub(crate) unsafe fn _take_chunked_unchecked_threaded(
         &self,
         chunk_ids: &[ChunkId],
+        sorted: IsSorted,
         rechunk: bool,
     ) -> Series {
         self.threaded_op(rechunk, chunk_ids.len(), &|offset, len| {
             let chunk_ids = &chunk_ids[offset..offset + len];
-            Ok(self._take_chunked_unchecked(chunk_ids))
+            Ok(self._take_chunked_unchecked(chunk_ids, sorted))
         })
         .unwrap()
     }
@@ -654,116 +660,6 @@ impl Series {
         }
     }
 
-    /// Apply a rolling variance to a Series. See:
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_var(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_var(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-
-    /// Apply a rolling std to a Series. See:
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_std(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_std(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-
-    /// Apply a rolling mean to a Series. See:
-    /// [ChunkedArray::rolling_mean]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_mean(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_mean(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-    /// Apply a rolling sum to a Series. See:
-    /// [ChunkedArray::rolling_sum]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_sum(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_sum(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-    /// Apply a rolling median to a Series. See:
-    /// [`ChunkedArray::rolling_median`]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_median(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_median(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-    /// Apply a rolling quantile to a Series. See:
-    /// [`ChunkedArray::rolling_quantile`]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_quantile(
-        &self,
-        _quantile: f64,
-        _interpolation: QuantileInterpolOptions,
-        _options: RollingOptions,
-    ) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_quantile(_quantile, _interpolation, _options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-    /// Apply a rolling min to a Series. See:
-    /// [ChunkedArray::rolling_min]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_min(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_min(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-    /// Apply a rolling max to a Series. See:
-    /// [ChunkedArray::rolling_max]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rolling_window")))]
-    pub fn rolling_max(&self, _options: RollingOptions) -> Result<Series> {
-        #[cfg(feature = "rolling_window")]
-        {
-            self._rolling_max(_options)
-        }
-        #[cfg(not(feature = "rolling_window"))]
-        {
-            panic!("activate 'rolling_window' feature")
-        }
-    }
-
     #[cfg(feature = "rank")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rank")))]
     pub fn rank(&self, options: RankOptions) -> Series {
@@ -812,10 +708,9 @@ impl Series {
         {
             panic!("activate feature dtype-date")
         }
+        #[cfg(feature = "dtype-date")]
         match self.dtype() {
-            #[cfg(feature = "dtype-date")]
             DataType::Int32 => self.i32().unwrap().clone().into_date().into_series(),
-            #[cfg(feature = "dtype-date")]
             DataType::Date => self
                 .date()
                 .unwrap()
@@ -832,15 +727,14 @@ impl Series {
             panic!("activate feature dtype-datetime")
         }
 
+        #[cfg(feature = "dtype-datetime")]
         match self.dtype() {
-            #[cfg(feature = "dtype-datetime")]
             DataType::Int64 => self
                 .i64()
                 .unwrap()
                 .clone()
                 .into_datetime(timeunit, tz)
                 .into_series(),
-            #[cfg(feature = "dtype-datetime")]
             DataType::Datetime(_, _) => self
                 .datetime()
                 .unwrap()
@@ -857,15 +751,14 @@ impl Series {
         {
             panic!("activate feature dtype-duration")
         }
+        #[cfg(feature = "dtype-duration")]
         match self.dtype() {
-            #[cfg(feature = "dtype-duration")]
             DataType::Int64 => self
                 .i64()
                 .unwrap()
                 .clone()
                 .into_duration(timeunit)
                 .into_series(),
-            #[cfg(feature = "dtype-duration")]
             DataType::Duration(_) => self
                 .duration()
                 .unwrap()
@@ -914,7 +807,7 @@ impl Series {
             Float64 => a.f64().unwrap().abs().into_series(),
             dt => {
                 return Err(PolarsError::InvalidOperation(
-                    format!("abs not supportedd for series of type {:?}", dt).into(),
+                    format!("abs not supported for series of type {:?}", dt).into(),
                 ));
             }
         };
@@ -953,7 +846,7 @@ impl Series {
         let val = [self.mean()];
         let s = Series::new(self.name(), val);
         if !self.dtype().is_numeric() {
-            s.cast(self.dtype()).unwrap()
+            Series::full_null(self.name(), 1, self.dtype())
         } else {
             s
         }
@@ -976,25 +869,6 @@ impl Series {
         #[cfg(not(feature = "bigidx"))]
         {
             self.u32()
-        }
-    }
-
-    /// Unpack to ChunkedArray of dtype struct
-    #[cfg(feature = "dtype-struct")]
-    pub fn struct_(&self) -> Result<&StructChunked> {
-        #[cfg(feature = "dtype-struct")]
-        match self.dtype() {
-            DataType::Struct(_) => {
-                let any = self.as_any();
-
-                debug_assert!(any.is::<StructChunked>());
-                // Safety
-                // We just checked type
-                Ok(unsafe { &*(any as *const dyn Any as *const StructChunked) })
-            }
-            _ => Err(PolarsError::SchemaMisMatch(
-                format!("Series dtype {:?} != struct", self.dtype()).into(),
-            )),
         }
     }
 
@@ -1121,7 +995,7 @@ mod test {
     #[test]
     fn new_series_from_arrow_primitive_array() {
         let array = UInt32Array::from_slice(&[1, 2, 3, 4, 5]);
-        let array_ref: ArrayRef = Arc::new(array);
+        let array_ref: ArrayRef = Box::new(array);
 
         let _ = Series::try_from(("foo", array_ref)).unwrap();
     }

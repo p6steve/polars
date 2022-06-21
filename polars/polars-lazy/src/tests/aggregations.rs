@@ -1,4 +1,5 @@
 use super::*;
+use polars_ops::prelude::ListNameSpaceImpl;
 
 #[test]
 fn test_agg_exprs() -> Result<()> {
@@ -187,13 +188,21 @@ fn test_power_in_agg_list1() -> Result<()> {
     let out = df
         .lazy()
         .groupby([col("fruits")])
-        .agg([col("A")
-            .rolling_min(RollingOptions {
-                window_size: 1,
-                ..Default::default()
-            })
-            .pow(2.0)
-            .alias("foo")])
+        .agg([
+            col("A")
+                .rolling_min(RollingOptions {
+                    window_size: Duration::new(1),
+                    ..Default::default()
+                })
+                .alias("input"),
+            col("A")
+                .rolling_min(RollingOptions {
+                    window_size: Duration::new(1),
+                    ..Default::default()
+                })
+                .pow(2.0)
+                .alias("foo"),
+        ])
         .sort(
             "fruits",
             SortOptions {
@@ -202,6 +211,7 @@ fn test_power_in_agg_list1() -> Result<()> {
             },
         )
         .collect()?;
+    dbg!(&out);
 
     let agg = out.column("foo")?.list()?;
     let first = agg.get(0).unwrap();
@@ -222,7 +232,7 @@ fn test_power_in_agg_list2() -> Result<()> {
         .groupby([col("fruits")])
         .agg([col("A")
             .rolling_min(RollingOptions {
-                window_size: 2,
+                window_size: Duration::new(2),
                 min_periods: 2,
                 ..Default::default()
             })
@@ -300,6 +310,7 @@ fn test_binary_agg_context_1() -> Result<()> {
             .otherwise(lit(90))
             .alias("vals")])
         .collect()?;
+    dbg!(&out);
 
     // if vals == 1 then sum(vals) else vals
     // [14, 90]

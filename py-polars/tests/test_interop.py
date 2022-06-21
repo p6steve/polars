@@ -181,14 +181,15 @@ def test_arrow_list_chunked_array() -> None:
 
 
 def test_from_pandas_null() -> None:
+    # null column is an object dtype, so pl.Utf8 is most close
     df = pd.DataFrame([{"a": None}, {"a": None}])
     out = pl.DataFrame(df)
-    assert out.dtypes == [pl.Float64]
+    assert out.dtypes == [pl.Utf8]
     assert out["a"][0] is None
 
     df = pd.DataFrame([{"a": None, "b": 1}, {"a": None, "b": 2}])
     out = pl.DataFrame(df)
-    assert out.dtypes == [pl.Float64, pl.Int64]
+    assert out.dtypes == [pl.Utf8, pl.Int64]
 
 
 def test_from_pandas_nested_list() -> None:
@@ -260,7 +261,7 @@ def test_from_pandas_dataframe() -> None:
     df = pl.from_pandas(pd_df)
     assert df.shape == (2, 3)
 
-    # if not a Pandas dataframe, raise a ValueError
+    # if not a pandas dataframe, raise a ValueError
     with pytest.raises(ValueError):
         _ = pl.from_pandas([1, 2])  # type: ignore
 
@@ -377,3 +378,21 @@ def test_pandas_string_none_conversion_3298() -> None:
     df_pd = pd.DataFrame(data)
     df_pl = pl.DataFrame(df_pd)
     assert df_pl.to_series().to_list() == [None, "b", "c", "d"]
+
+
+def test_cat_int_types_3500() -> None:
+    with pl.StringCache():
+        # Create an enum / categorical / dictionary typed pyarrow array
+        # Most simply done by creating a pandas categorical series first
+        categorical_df = pd.Series(["a", "a", "b"], dtype="category")
+        pyarrow_array = pa.Array.from_pandas(categorical_df)
+
+        # The in-memory representation of each category can either be a signed or unsigned 8-bit integer
+        # Pandas uses Int8...
+        int_dict_type = pa.dictionary(index_type=pa.int8(), value_type=pa.utf8())
+        # ... while DuckDB uses UInt8
+        uint_dict_type = pa.dictionary(index_type=pa.uint8(), value_type=pa.utf8())
+
+        for t in [int_dict_type, uint_dict_type]:
+            s = pl.from_arrow(pyarrow_array.cast(t))
+            assert s.series_equal(pl.Series(["a", "a", "b"]).cast(pl.Categorical))

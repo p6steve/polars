@@ -57,7 +57,7 @@ macro_rules! impl_dyn_series {
                 self.0.cummin(reverse).$into_logical().into_series()
             }
 
-            fn set_sorted(&mut self, reverse: bool) {
+            fn _set_sorted(&mut self, reverse: bool) {
                 self.0.deref_mut().set_sorted(reverse)
             }
 
@@ -77,15 +77,15 @@ macro_rules! impl_dyn_series {
                 self.0.vec_hash_combine(build_hasher, hashes)
             }
 
-            fn agg_min(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_min(groups).$into_logical().into_series()
             }
 
-            fn agg_max(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_max(groups).$into_logical().into_series()
             }
 
-            fn agg_list(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
                 // we cannot cast and dispatch as the inner type of the list would be incorrect
                 self.0
                     .agg_list(groups)
@@ -93,7 +93,7 @@ macro_rules! impl_dyn_series {
                     .unwrap()
             }
 
-            fn agg_quantile(
+            unsafe fn agg_quantile(
                 &self,
                 groups: &GroupsProxy,
                 quantile: f64,
@@ -105,7 +105,7 @@ macro_rules! impl_dyn_series {
                     .into_series()
             }
 
-            fn agg_median(&self, groups: &GroupsProxy) -> Series {
+            unsafe fn agg_median(&self, groups: &GroupsProxy) -> Series {
                 self.0.agg_median(groups).$into_logical().into_series()
             }
 
@@ -208,38 +208,6 @@ macro_rules! impl_dyn_series {
                 self.0.shrink_to_fit()
             }
 
-            #[cfg(feature = "dtype-time")]
-            fn time(&self) -> Result<&TimeChunked> {
-                if matches!(self.0.dtype(), DataType::Time) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const TimeChunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into Time",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
-            #[cfg(feature = "dtype-date")]
-            fn date(&self) -> Result<&DateChunked> {
-                if matches!(self.0.dtype(), DataType::Date) {
-                    unsafe { Ok(&*(self as *const dyn SeriesTrait as *const DateChunked)) }
-                } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!(
-                            "cannot unpack Series: {:?} of type {:?} into Date",
-                            self.name(),
-                            self.dtype(),
-                        )
-                        .into(),
-                    ))
-                }
-            }
-
             fn append_array(&mut self, other: ArrayRef) -> Result<()> {
                 self.0.append_array(other)
             }
@@ -294,8 +262,8 @@ macro_rules! impl_dyn_series {
             }
 
             #[cfg(feature = "chunked_ids")]
-            unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-                let ca = self.0.deref().take_chunked_unchecked(by);
+            unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+                let ca = self.0.deref().take_chunked_unchecked(by, sorted);
                 ca.$into_logical().into_series()
             }
 
@@ -326,9 +294,13 @@ macro_rules! impl_dyn_series {
             }
 
             unsafe fn take_unchecked(&self, idx: &IdxCa) -> Result<Series> {
-                Ok(ChunkTake::take_unchecked(self.0.deref(), idx.into())
-                    .$into_logical()
-                    .into_series())
+                let mut out = ChunkTake::take_unchecked(self.0.deref(), idx.into());
+
+                if self.0.is_sorted() && (idx.is_sorted() || idx.is_sorted_reverse()) {
+                    out.set_sorted(idx.is_sorted_reverse())
+                }
+
+                Ok(out.$into_logical().into_series())
             }
 
             unsafe fn take_opt_iter_unchecked(&self, iter: &mut dyn TakeIteratorNulls) -> Series {
@@ -501,12 +473,6 @@ macro_rules! impl_dyn_series {
                 Arc::new(SeriesWrap(Clone::clone(&self.0)))
             }
 
-            fn pow(&self, _exponent: f64) -> Result<Series> {
-                Err(PolarsError::ComputeError(
-                    "cannot compute power of logical".into(),
-                ))
-            }
-
             fn peak_max(&self) -> BooleanChunked {
                 self.0.peak_max()
             }
@@ -593,7 +559,7 @@ mod test {
         let s = Series::new("foo", &[1, 2, 3]);
         let s = s.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))?;
 
-        let l = s.agg_list(&GroupsProxy::Idx(vec![(0, vec![0, 1, 2])].into()));
+        let l = unsafe { s.agg_list(&GroupsProxy::Idx(vec![(0, vec![0, 1, 2])].into())) };
 
         match l.dtype() {
             DataType::List(inner) => {

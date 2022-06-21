@@ -2,14 +2,13 @@
 use crate::chunked_array::object::PolarsObjectSafe;
 pub use crate::prelude::ChunkCompare;
 use crate::prelude::*;
-use arrow::array::ArrayRef;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use std::any::Any;
 use std::borrow::Cow;
 #[cfg(feature = "temporal")]
 use std::sync::Arc;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum IsSorted {
     Ascending,
     Descending,
@@ -80,56 +79,6 @@ pub(crate) mod private {
             invalid_operation_panic!(self)
         }
 
-        /// Apply a rolling mean to a Series. See:
-        /// [ChunkedArray::rolling_mean](crate::prelude::ChunkWindow::rolling_mean).
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_mean(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-        /// Apply a rolling sum to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_sum(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-        /// Apply a rolling median to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_median(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-        /// Apply a rolling quantile to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_quantile(
-            &self,
-            _quantile: f64,
-            _interpolation: QuantileInterpolOptions,
-            _options: RollingOptions,
-        ) -> Result<Series> {
-            invalid_operation!(self)
-        }
-
-        /// Apply a rolling min to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_min(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-        /// Apply a rolling max to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_max(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-
-        /// Apply a rolling variance to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_var(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-
-        /// Apply a rolling std_dev to a Series.
-        #[cfg(feature = "rolling_window")]
-        fn _rolling_std(&self, _options: RollingOptions) -> Result<Series> {
-            invalid_operation!(self)
-        }
-
         /// Get an array with the cumulative max computed at every element
         #[cfg(feature = "cum_agg")]
         fn _cummax(&self, _reverse: bool) -> Series {
@@ -142,7 +91,7 @@ pub(crate) mod private {
             panic!("operation cummin not supported for this dtype")
         }
 
-        fn set_sorted(&mut self, _reverse: bool) {
+        fn _set_sorted(&mut self, _reverse: bool) {
             invalid_operation_panic!(self)
         }
 
@@ -168,27 +117,27 @@ pub(crate) mod private {
         fn vec_hash_combine(&self, _build_hasher: RandomState, _hashes: &mut [u64]) {
             invalid_operation_panic!(self)
         }
-        fn agg_min(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
-        fn agg_max(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
         /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
         /// first cast to `Int64` to prevent overflow issues.
-        fn agg_sum(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_sum(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
-        fn agg_std(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_std(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
-        fn agg_var(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_var(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
-        fn agg_list(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
-        fn agg_quantile(
+        unsafe fn agg_quantile(
             &self,
             groups: &GroupsProxy,
             _quantile: f64,
@@ -196,7 +145,7 @@ pub(crate) mod private {
         ) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
-        fn agg_median(&self, groups: &GroupsProxy) -> Series {
+        unsafe fn agg_median(&self, groups: &GroupsProxy) -> Series {
             Series::full_null(self._field().name(), groups.len(), self._dtype())
         }
         fn zip_outer_join_column(
@@ -253,24 +202,33 @@ pub trait SeriesTrait:
     fn rename(&mut self, name: &str);
 
     fn bitand(&self, _other: &Series) -> Result<Series> {
-        panic!(
-            "bitwise and operation not supported for dtype {:?}",
-            self.dtype()
-        )
+        Err(PolarsError::InvalidOperation(
+            format!(
+                "bitwise 'AND' operation not supported for dtype {:?}",
+                self.dtype()
+            )
+            .into(),
+        ))
     }
 
     fn bitor(&self, _other: &Series) -> Result<Series> {
-        panic!(
-            "bitwise or operation not fit supported for dtype {:?}",
-            self.dtype()
-        )
+        Err(PolarsError::InvalidOperation(
+            format!(
+                "bitwise 'OR' operation not supported for dtype {:?}",
+                self.dtype()
+            )
+            .into(),
+        ))
     }
 
     fn bitxor(&self, _other: &Series) -> Result<Series> {
-        panic!(
-            "bitwise xor operation not fit supported for dtype {:?}",
-            self.dtype()
-        )
+        Err(PolarsError::InvalidOperation(
+            format!(
+                "bitwise 'XOR' operation not supported for dtype {:?}",
+                self.dtype()
+            )
+            .into(),
+        ))
     }
 
     /// Get the lengths of the underlying chunks
@@ -293,9 +251,7 @@ pub trait SeriesTrait:
     }
 
     /// Underlying chunks.
-    fn chunks(&self) -> &Vec<ArrayRef> {
-        invalid_operation_panic!(self)
-    }
+    fn chunks(&self) -> &Vec<ArrayRef>;
 
     /// Number of chunks in this Series
     fn n_chunks(&self) -> usize {
@@ -305,150 +261,6 @@ pub trait SeriesTrait:
     /// Shrink the capacity of this array to fit it's length.
     fn shrink_to_fit(&mut self) {
         panic!("shrink to fit not supported for dtype {:?}", self.dtype())
-    }
-
-    /// Unpack to ChunkedArray of dtype i8
-    fn i8(&self) -> Result<&Int8Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != i8", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray i16
-    fn i16(&self) -> Result<&Int16Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != i16", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray
-    /// ```
-    /// # use polars_core::prelude::*;
-    /// let s: Series = [1, 2, 3].iter().collect();
-    /// let s_squared: Series = s.i32()
-    ///     .unwrap()
-    ///     .into_iter()
-    ///     .map(|opt_v| {
-    ///         match opt_v {
-    ///             Some(v) => Some(v * v),
-    ///             None => None, // null value
-    ///         }
-    /// }).collect();
-    /// ```
-    fn i32(&self) -> Result<&Int32Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != i32", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype i64
-    fn i64(&self) -> Result<&Int64Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != i64", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype f32
-    fn f32(&self) -> Result<&Float32Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != f32", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype f64
-    fn f64(&self) -> Result<&Float64Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != f64", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype u8
-    fn u8(&self) -> Result<&UInt8Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != u8", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype u16
-    fn u16(&self) -> Result<&UInt16Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != u16", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype u32
-    fn u32(&self) -> Result<&UInt32Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != u32", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype u64
-    fn u64(&self) -> Result<&UInt64Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != u64", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype bool
-    fn bool(&self) -> Result<&BooleanChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != bool", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype utf8
-    fn utf8(&self) -> Result<&Utf8Chunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != utf8", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype Time
-    #[cfg(feature = "dtype-time")]
-    fn time(&self) -> Result<&TimeChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != Time", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype Date
-    #[cfg(feature = "dtype-date")]
-    fn date(&self) -> Result<&DateChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!(" Series dtype {:?} != Date", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype datetime
-    #[cfg(feature = "dtype-datetime")]
-    fn datetime(&self) -> Result<&DatetimeChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != datetime", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype duration
-    #[cfg(feature = "dtype-duration")]
-    fn duration(&self) -> Result<&DurationChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != duration", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype list
-    fn list(&self) -> Result<&ListChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != list", self.dtype()).into(),
-        ))
-    }
-
-    /// Unpack to ChunkedArray of dtype categorical
-    #[cfg(feature = "dtype-categorical")]
-    fn categorical(&self) -> Result<&CategoricalChunked> {
-        Err(PolarsError::SchemaMisMatch(
-            format!("Series dtype {:?} != categorical", self.dtype()).into(),
-        ))
     }
 
     /// Append Arrow array of same dtype to this Series.
@@ -486,7 +298,7 @@ pub trait SeriesTrait:
 
     #[doc(hidden)]
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series;
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series;
 
     #[doc(hidden)]
     #[cfg(feature = "chunked_ids")]
@@ -732,10 +544,10 @@ pub trait SeriesTrait:
     /// fn example() -> Result<()> {
     ///     let s = Series::new("some_missing", &[Some(1), None, Some(2)]);
     ///
-    ///     let filled = s.fill_null(FillNullStrategy::Forward)?;
+    ///     let filled = s.fill_null(FillNullStrategy::Forward(None))?;
     ///     assert_eq!(Vec::from(filled.i32()?), &[Some(1), Some(1), Some(2)]);
     ///
-    ///     let filled = s.fill_null(FillNullStrategy::Backward)?;
+    ///     let filled = s.fill_null(FillNullStrategy::Backward(None))?;
     ///     assert_eq!(Vec::from(filled.i32()?), &[Some(1), Some(2), Some(2)]);
     ///
     ///     let filled = s.fill_null(FillNullStrategy::Min)?;
@@ -819,13 +631,6 @@ pub trait SeriesTrait:
         invalid_operation_panic!(self)
     }
 
-    /// Raise a numeric series to the power of exponent.
-    fn pow(&self, _exponent: f64) -> Result<Series> {
-        Err(PolarsError::InvalidOperation(
-            format!("power operation not supported on dtype {:?}", self.dtype()).into(),
-        ))
-    }
-
     /// Get a boolean mask of the local maximum peaks.
     fn peak_max(&self) -> BooleanChunked {
         invalid_operation_panic!(self)
@@ -874,7 +679,7 @@ pub trait SeriesTrait:
     fn rolling_apply(
         &self,
         _f: &dyn Fn(&Series) -> Series,
-        _options: RollingOptions,
+        _options: RollingOptionsFixedWindow,
     ) -> Result<Series> {
         panic!("rolling apply not implemented for this dtype. Only implemented for numeric data.")
     }

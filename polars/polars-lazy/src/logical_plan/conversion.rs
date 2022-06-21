@@ -5,7 +5,7 @@ fn to_aexprs(input: Vec<Expr>, arena: &mut Arena<AExpr>) -> Vec<Node> {
     input.into_iter().map(|e| to_aexpr(e, arena)).collect()
 }
 
-// converts expression to AExpr, which uses an arena (Vec) for allocation
+/// converts expression to AExpr and adds it to the arena, which uses an arena (Vec) for allocation
 pub(crate) fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
     let v = match expr {
         Expr::IsUnique(expr) => AExpr::IsUnique(to_aexpr(*expr, arena)),
@@ -151,12 +151,34 @@ pub(crate) fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
     arena.add(v)
 }
 
+/// converts LogicalPlan to ALogicalPlan
+/// it adds expressions & lps to the respective arenas as it traverses the plan
+/// finally it returns the top node of the logical plan
 pub(crate) fn to_alp(
     lp: LogicalPlan,
     expr_arena: &mut Arena<AExpr>,
     lp_arena: &mut Arena<ALogicalPlan>,
 ) -> Result<Node> {
     let v = match lp {
+        LogicalPlan::AnonymousScan {
+            function,
+            schema,
+            predicate,
+            aggregate,
+            options,
+        } => ALogicalPlan::AnonymousScan {
+            function,
+            schema,
+            output_schema: None,
+            predicate: predicate.map(|expr| to_aexpr(expr, expr_arena)),
+            aggregate: aggregate
+                .into_iter()
+                .map(|expr| to_aexpr(expr, expr_arena))
+                .collect(),
+            options,
+        },
+        #[cfg(feature = "python")]
+        LogicalPlan::PythonScan { options } => ALogicalPlan::PythonScan { options },
         LogicalPlan::Union { inputs, options } => {
             let inputs = inputs
                 .into_iter()
@@ -408,6 +430,7 @@ pub(crate) fn to_alp(
     Ok(lp_arena.add(v))
 }
 
+/// converts a node from the AExpr arena to Expr
 pub(crate) fn node_to_expr(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
     let expr = expr_arena.get(node).clone();
 
@@ -635,6 +658,7 @@ fn nodes_to_exprs(nodes: &[Node], expr_arena: &Arena<AExpr>) -> Vec<Expr> {
     nodes.iter().map(|n| node_to_expr(*n, expr_arena)).collect()
 }
 
+/// converts a node from the ALogicalPlan arena to a LogicalPlan
 pub(crate) fn node_to_lp(
     node: Node,
     expr_arena: &mut Arena<AExpr>,
@@ -644,6 +668,22 @@ pub(crate) fn node_to_lp(
     let lp = std::mem::take(lp);
 
     match lp {
+        ALogicalPlan::AnonymousScan {
+            function,
+            schema,
+            output_schema: _,
+            aggregate,
+            predicate,
+            options,
+        } => LogicalPlan::AnonymousScan {
+            function,
+            schema,
+            predicate: predicate.map(|n| node_to_expr(n, expr_arena)),
+            aggregate: nodes_to_exprs(&aggregate, expr_arena),
+            options,
+        },
+        #[cfg(feature = "python")]
+        ALogicalPlan::PythonScan { options } => LogicalPlan::PythonScan { options },
         ALogicalPlan::Union { inputs, options } => {
             let inputs = inputs
                 .into_iter()

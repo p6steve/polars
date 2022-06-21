@@ -8,6 +8,7 @@ pub(crate) unsafe fn arr_to_any_value<'a>(
     idx: usize,
     dtype: &'a DataType,
 ) -> AnyValue<'a> {
+    debug_assert!(idx < arr.len());
     if arr.is_null(idx) {
         return AnyValue::Null;
     }
@@ -40,7 +41,7 @@ pub(crate) unsafe fn arr_to_any_value<'a>(
         DataType::Float32 => downcast_and_pack!(Float32Array, Float32),
         DataType::Float64 => downcast_and_pack!(Float64Array, Float64),
         DataType::List(dt) => {
-            let v: ArrayRef = downcast!(LargeListArray).into();
+            let v: ArrayRef = downcast!(LargeListArray);
             let mut s = Series::try_from(("", v)).unwrap();
 
             match &**dt {

@@ -34,12 +34,17 @@ macro_rules! init_method {
         #[pymethods]
         impl PySeries {
             #[staticmethod]
-            pub fn $name(name: &str, val: &PyArray1<$type>, _strict: bool) -> PySeries {
-                unsafe {
-                    PySeries {
-                        series: Series::new(name, val.as_slice().unwrap()),
-                    }
-                }
+            pub fn $name(
+                py: Python,
+                name: &str,
+                array: &PyArray1<$type>,
+                _strict: bool,
+            ) -> PySeries {
+                let array = array.readonly();
+                let vals = array.as_slice().unwrap();
+                py.allow_threads(|| PySeries {
+                    series: Series::new(name, vals),
+                })
             }
         }
     };
@@ -58,41 +63,39 @@ init_method!(new_u64, u64);
 #[pymethods]
 impl PySeries {
     #[staticmethod]
-    pub fn new_f32(name: &str, val: &PyArray1<f32>, nan_is_null: bool) -> PySeries {
-        // numpy array as slice is unsafe
-        unsafe {
+    pub fn new_f32(py: Python, name: &str, array: &PyArray1<f32>, nan_is_null: bool) -> PySeries {
+        let array = array.readonly();
+        let vals = array.as_slice().unwrap();
+        py.allow_threads(|| {
             if nan_is_null {
-                let mut ca: Float32Chunked = val
-                    .as_slice()
-                    .expect("contiguous array")
+                let mut ca: Float32Chunked = vals
                     .iter()
                     .map(|&val| if f32::is_nan(val) { None } else { Some(val) })
                     .collect_trusted();
                 ca.rename(name);
                 ca.into_series().into()
             } else {
-                Series::new(name, val.as_slice().unwrap()).into()
+                Series::new(name, vals).into()
             }
-        }
+        })
     }
 
     #[staticmethod]
-    pub fn new_f64(name: &str, val: &PyArray1<f64>, nan_is_null: bool) -> PySeries {
-        // numpy array as slice is unsafe
-        unsafe {
+    pub fn new_f64(py: Python, name: &str, array: &PyArray1<f64>, nan_is_null: bool) -> PySeries {
+        let array = array.readonly();
+        let vals = array.as_slice().unwrap();
+        py.allow_threads(|| {
             if nan_is_null {
-                let mut ca: Float64Chunked = val
-                    .as_slice()
-                    .expect("contiguous array")
+                let mut ca: Float64Chunked = vals
                     .iter()
                     .map(|&val| if f64::is_nan(val) { None } else { Some(val) })
                     .collect_trusted();
                 ca.rename(name);
                 ca.into_series().into()
             } else {
-                Series::new(name, val.as_slice().unwrap()).into()
+                Series::new(name, vals).into()
             }
-        }
+        })
     }
 
     pub fn struct_to_frame(&self) -> PyResult<PyDataFrame> {
@@ -198,6 +201,14 @@ impl From<Series> for PySeries {
 )]
 impl PySeries {
     #[staticmethod]
+    pub fn new_from_anyvalues(name: &str, val: Vec<Wrap<AnyValue<'_>>>) -> PyResult<PySeries> {
+        let avs = slice_extract_wrapped(&val);
+        // from anyvalues is fallible
+        let s = Series::from_any_values(name, avs).map_err(PyPolarsErr::from)?;
+        Ok(s.into())
+    }
+
+    #[staticmethod]
     pub fn new_str(name: &str, val: Wrap<Utf8Chunked>, _strict: bool) -> Self {
         let mut s = val.0.into_series();
         s.rename(name);
@@ -252,9 +263,32 @@ impl PySeries {
     #[staticmethod]
     pub fn from_arrow(name: &str, array: &PyAny) -> PyResult<Self> {
         let arr = array_to_rust(array)?;
-        let series: Series =
-            std::convert::TryFrom::try_from((name, arr)).map_err(PyPolarsErr::from)?;
-        Ok(series.into())
+
+        match arr.data_type() {
+            ArrowDataType::LargeList(_) => {
+                let array = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
+
+                let mut previous = 0;
+                let mut fast_explode = true;
+                for &o in array.offsets().as_slice()[1..].iter() {
+                    if o == previous {
+                        fast_explode = false;
+                        break;
+                    }
+                    previous = o;
+                }
+                let mut out = ListChunked::from_chunks(name, vec![arr]);
+                if fast_explode {
+                    out.set_fast_explode()
+                }
+                return Ok(out.into_series().into());
+            }
+            _ => {
+                let series: Series =
+                    std::convert::TryFrom::try_from((name, arr)).map_err(PyPolarsErr::from)?;
+                Ok(series.into())
+            }
+        }
     }
 
     #[staticmethod]
@@ -307,7 +341,22 @@ impl PySeries {
     }
 
     pub fn get_fmt(&self, index: usize) -> String {
-        format!("{}", self.series.get(index))
+        let val = format!("{}", self.series.get(index));
+        if let DataType::Utf8 | DataType::Categorical(_) = self.series.dtype() {
+            let v_trunc = &val[..val
+                .char_indices()
+                .take(15)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0)];
+            if val == v_trunc {
+                val
+            } else {
+                format!("{}...", v_trunc)
+            }
+        } else {
+            val
+        }
     }
 
     pub fn rechunk(&mut self, in_place: bool) -> Option<Self> {
@@ -384,6 +433,12 @@ impl PySeries {
             .dtype()
             .inner_dtype()
             .map(|dt| Wrap(dt.clone()).to_object(py))
+    }
+
+    fn set_sorted(&self, reverse: bool) -> Self {
+        let mut out = self.series.clone();
+        out.set_sorted(reverse);
+        out.into()
     }
 
     pub fn mean(&self) -> Option<f64> {
@@ -571,10 +626,16 @@ impl PySeries {
         Ok(ca.into_series().into())
     }
 
-    pub fn sample_n(&self, n: usize, with_replacement: bool, seed: Option<u64>) -> PyResult<Self> {
+    pub fn sample_n(
+        &self,
+        n: usize,
+        with_replacement: bool,
+        shuffle: bool,
+        seed: Option<u64>,
+    ) -> PyResult<Self> {
         let s = self
             .series
-            .sample_n(n, with_replacement, seed)
+            .sample_n(n, with_replacement, shuffle, seed)
             .map_err(PyPolarsErr::from)?;
         Ok(s.into())
     }
@@ -583,11 +644,12 @@ impl PySeries {
         &self,
         frac: f64,
         with_replacement: bool,
+        shuffle: bool,
         seed: Option<u64>,
     ) -> PyResult<Self> {
         let s = self
             .series
-            .sample_frac(frac, with_replacement, seed)
+            .sample_frac(frac, with_replacement, shuffle, seed)
             .map_err(PyPolarsErr::from)?;
         Ok(s.into())
     }
@@ -791,8 +853,8 @@ impl PySeries {
         self.series.drop_nulls().into()
     }
 
-    pub fn fill_null(&self, strategy: &str) -> PyResult<Self> {
-        let strat = parse_strategy(strategy);
+    pub fn fill_null(&self, strategy: &str, limit: Option<IdxSize>) -> PyResult<Self> {
+        let strat = parse_strategy(strategy, limit)?;
         let series = self.series.fill_null(strat).map_err(PyPolarsErr::from)?;
         Ok(PySeries::new(series))
     }
@@ -1045,9 +1107,15 @@ impl PySeries {
         Ok(PySeries::new(s))
     }
 
-    pub fn str_contains(&self, pat: &str) -> PyResult<Self> {
+    pub fn str_contains(&self, pat: &str, literal: Option<bool>) -> PyResult<Self> {
         let ca = self.series.utf8().map_err(PyPolarsErr::from)?;
-        let s = ca.contains(pat).map_err(PyPolarsErr::from)?.into_series();
+        let s = if literal.unwrap_or(false) {
+            ca.contains_literal(pat)
+        } else {
+            ca.contains(pat)
+        }
+        .map_err(PyPolarsErr::from)?
+        .into_series();
         Ok(s.into())
     }
 
@@ -1165,175 +1233,6 @@ impl PySeries {
         } else {
             None
         }
-    }
-    pub fn rolling_sum(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_sum(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn rolling_mean(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_mean(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn rolling_median(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_median(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn rolling_quantile(
-        &self,
-        quantile: f64,
-        interpolation: Wrap<QuantileInterpolOptions>,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let interpol = interpolation.0;
-        let s = self
-            .series
-            .rolling_quantile(quantile, interpol, options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn rolling_max(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_max(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-    pub fn rolling_min(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_min(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn rolling_var(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_var(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
-    }
-
-    pub fn rolling_std(
-        &self,
-        window_size: usize,
-        weights: Option<Vec<f64>>,
-        min_periods: usize,
-        center: bool,
-    ) -> PyResult<Self> {
-        let options = RollingOptions {
-            window_size,
-            weights,
-            min_periods,
-            center,
-        };
-
-        let s = self
-            .series
-            .rolling_std(options)
-            .map_err(PyPolarsErr::from)?;
-        Ok(s.into())
     }
 
     pub fn year(&self) -> PyResult<Self> {
@@ -1668,6 +1567,7 @@ impl_set_at_idx!(set_at_idx_i8, i8, i8, Int8);
 impl_set_at_idx!(set_at_idx_i16, i16, i16, Int16);
 impl_set_at_idx!(set_at_idx_i32, i32, i32, Int32);
 impl_set_at_idx!(set_at_idx_i64, i64, i64, Int64);
+impl_set_at_idx!(set_at_idx_bool, bool, bool, Boolean);
 
 macro_rules! impl_get {
     ($name:ident, $series_variant:ident, $type:ty) => {
@@ -1987,7 +1887,7 @@ pub(crate) fn to_series_collection(ps: Vec<PySeries>) -> Vec<Series> {
     let len = ps.len();
     let cap = ps.capacity();
 
-    // The pointer ownership will be transferred to Vec and this will be responsible for dealoc
+    // The pointer ownership will be transferred to Vec and this will be responsible for dealloc
     unsafe { Vec::from_raw_parts(p, len, cap) }
 }
 

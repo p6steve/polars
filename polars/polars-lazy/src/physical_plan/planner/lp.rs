@@ -71,6 +71,8 @@ impl DefaultPlanner {
         use ALogicalPlan::*;
         let logical_plan = lp_arena.take(root);
         match logical_plan {
+            #[cfg(feature = "python")]
+            PythonScan { options } => Ok(Box::new(executors::PythonScanExec { options })),
             Union { inputs, options } => {
                 let inputs = inputs
                     .into_iter()
@@ -224,6 +226,21 @@ impl DefaultPlanner {
                     has_windows,
                 }))
             }
+            AnonymousScan {
+                function,
+                predicate,
+                options,
+                ..
+            } => {
+                let predicate = predicate
+                    .map(|pred| self.create_physical_expr(pred, Context::Default, expr_arena))
+                    .map_or(Ok(None), |v| v.map(Some))?;
+                Ok(Box::new(executors::AnonymousScanExec {
+                    function,
+                    predicate,
+                    options,
+                }))
+            }
             Sort {
                 input,
                 by_column,
@@ -350,12 +367,19 @@ impl DefaultPlanner {
                                 }
                             }
 
+                            let has_aggregation = |node: Node| {
+                                has_aexpr(node, expr_arena, |ae| matches!(ae, AExpr::Agg(_)))
+                            };
+
                             // check if the aggregation type is partitionable
                             // only simple aggregation like col().sum
                             // that can be divided in to the aggregation of their partitions are allowed
                             if !((&*expr_arena).iter(*agg).all(|(_, ae)| {
                                 use AExpr::*;
                                 match ae {
+                                    // struct is needed to keep both states
+                                    #[cfg(feature = "dtype-struct")]
+                                    Agg(AAggExpr::Mean(_)) => true,
                                     // only allowed expressions
                                     Agg(agg_e) => {
                                         matches!(
@@ -363,12 +387,21 @@ impl DefaultPlanner {
                                             AAggExpr::Min(_)
                                                 | AAggExpr::Max(_)
                                                 | AAggExpr::Sum(_)
-                                                | AAggExpr::Mean(_)
                                                 | AAggExpr::Last(_)
                                                 | AAggExpr::First(_)
+                                                | AAggExpr::Count(_)
                                         )
                                     },
-                                    Column(_) | Alias(_, _) => {
+                                    Not(input) | IsNull(input) | IsNotNull(input) => {
+                                        !has_aggregation(*input)
+                                    }
+                                    BinaryExpr {left, right, ..} => {
+                                        !has_aggregation(*left) && !has_aggregation(*right)
+                                    }
+                                    Ternary {truthy, falsy, predicate,..} => {
+                                        !has_aggregation(*truthy) && !has_aggregation(*falsy) && !has_aggregation(*predicate)
+                                    }
+                                    Column(_) | Alias(_, _) | Count | Literal(_) | Cast {..} => {
                                         true
                                     }
                                     _ => {
@@ -407,9 +440,6 @@ impl DefaultPlanner {
                         input,
                         phys_keys,
                         phys_aggs,
-                        aggs.into_iter()
-                            .map(|n| node_to_expr(n, expr_arena))
-                            .collect(),
                         maintain_order,
                         options.slice,
                         input_schema,

@@ -15,11 +15,10 @@ fn init_set() -> PlHashSet<Arc<str>> {
 }
 
 /// utility function to get names of the columns needed in projection at scan level
-#[cfg(any(feature = "parquet", feature = "csv-file"))]
 fn get_scan_columns(
     acc_projections: &mut Vec<Node>,
     expr_arena: &Arena<AExpr>,
-) -> Option<Vec<String>> {
+) -> Option<Arc<Vec<String>>> {
     let mut with_columns = None;
     if !acc_projections.is_empty() {
         let mut columns = Vec::with_capacity(acc_projections.len());
@@ -28,7 +27,7 @@ fn get_scan_columns(
                 columns.push((*name).to_owned())
             }
         }
-        with_columns = Some(columns);
+        with_columns = Some(Arc::new(columns));
     }
     with_columns
 }
@@ -96,8 +95,8 @@ fn update_scan_schema(
     schema: &Schema,
     // this is only needed for parsers that sort the projections
     // currently these are:
-    // sorting parsers: csv and ipc,
-    // non-sorting: parquet
+    // sorting parsers: csv,
+    // non-sorting: parquet, ipc
     sort_projections: bool,
 ) -> Schema {
     let mut new_schema = Schema::with_capacity(acc_projections.len());
@@ -338,6 +337,50 @@ impl ProjectionPushDown {
                     .project_local(proj)
                     .build())
             }
+            AnonymousScan {
+                function,
+                schema,
+                predicate,
+                mut options,
+                output_schema,
+                aggregate,
+            } => {
+                if function.allows_projection_pushdown() {
+                    options.with_columns = get_scan_columns(&mut acc_projections, expr_arena);
+
+                    let output_schema = if options.with_columns.is_none() {
+                        None
+                    } else {
+                        Some(Arc::new(update_scan_schema(
+                            &acc_projections,
+                            expr_arena,
+                            &*schema,
+                            true,
+                        )))
+                    };
+                    options.output_schema = output_schema.clone();
+
+                    let lp = AnonymousScan {
+                        function,
+                        schema,
+                        output_schema,
+                        options,
+                        predicate,
+                        aggregate,
+                    };
+                    Ok(lp)
+                } else {
+                    let lp = AnonymousScan {
+                        function,
+                        schema,
+                        predicate,
+                        options,
+                        output_schema,
+                        aggregate,
+                    };
+                    Ok(lp)
+                }
+            }
             DataFrameScan {
                 df,
                 mut schema,
@@ -379,7 +422,7 @@ impl ProjectionPushDown {
                         &acc_projections,
                         expr_arena,
                         &*schema,
-                        true,
+                        false,
                     )))
                 };
                 options.with_columns = with_columns;
@@ -426,6 +469,22 @@ impl ProjectionPushDown {
                     options,
                 };
                 Ok(lp)
+            }
+            #[cfg(feature = "python")]
+            PythonScan { mut options } => {
+                options.with_columns = get_scan_columns(&mut acc_projections, expr_arena);
+
+                options.output_schema = if options.with_columns.is_none() {
+                    None
+                } else {
+                    Some(Arc::new(update_scan_schema(
+                        &acc_projections,
+                        expr_arena,
+                        &*options.schema,
+                        true,
+                    )))
+                };
+                Ok(PythonScan { options })
             }
             #[cfg(feature = "csv-file")]
             CsvScan {

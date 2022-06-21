@@ -1,9 +1,8 @@
 # flake8: noqa: W191,E101
-import io
 import sys
 import typing
 from builtins import range
-from datetime import datetime
+from datetime import date, datetime, time
 from io import BytesIO
 from typing import Any, Iterator, Type
 from unittest.mock import patch
@@ -15,8 +14,11 @@ import pytest
 
 import polars as pl
 from polars import testing
-from polars.datatypes import List
-from polars.internals.frame import DataFrame
+
+if sys.version_info >= (3, 8):
+    from typing import Literal
+else:
+    from typing_extensions import Literal  # pragma: no cover
 
 
 def test_version() -> None:
@@ -36,19 +38,31 @@ def test_init_only_columns() -> None:
     assert df.frame_equal(truth, null_equal=True)
     assert df.dtypes == [pl.Float32, pl.Float32, pl.Float32]
 
-    df = pl.DataFrame(
-        columns=[("a", pl.Date), ("b", pl.UInt64), ("c", pl.datatypes.Int8)]
-    )
-    truth = pl.DataFrame({"a": [], "b": [], "c": []}).with_columns(
-        [
-            pl.col("a").cast(pl.Date),
-            pl.col("b").cast(pl.UInt64),
-            pl.col("c").cast(pl.Int8),
-        ]
-    )
-    assert df.shape == (0, 3)
-    assert df.frame_equal(truth, null_equal=True)
-    assert df.dtypes == [pl.Date, pl.UInt64, pl.Int8]
+    # Validate construction with various flavours of no/empty data
+    no_data: Any
+    for no_data in (None, {}, []):
+        df = pl.DataFrame(
+            data=no_data,
+            columns=[  # type: ignore
+                ("a", pl.Date),
+                ("b", pl.UInt64),
+                ("c", pl.datatypes.Int8),
+                ("d", pl.List(pl.UInt8)),
+            ],
+        )
+        truth = pl.DataFrame({"a": [], "b": [], "c": []}).with_columns(
+            [
+                pl.col("a").cast(pl.Date),
+                pl.col("b").cast(pl.UInt64),
+                pl.col("c").cast(pl.Int8),
+            ]
+        )
+        truth.insert_at_idx(3, pl.Series("d", [], pl.List(pl.UInt8)))
+
+        assert df.shape == (0, 4)
+        assert df.frame_equal(truth, null_equal=True)
+        assert df.dtypes == [pl.Date, pl.UInt64, pl.Int8, pl.List]
+        assert getattr(df.schema["d"], "inner") == pl.UInt8
 
 
 def test_init_dict() -> None:
@@ -68,6 +82,11 @@ def test_init_dict() -> None:
         assert df.shape == (0, 2)
         assert df.schema == {"a": pl.Date, "b": pl.Utf8}
 
+    # List of empty list/tuple
+    df = pl.DataFrame({"a": [[]], "b": [()]})
+    assert df.schema == {"a": pl.List(pl.Float64), "b": pl.List(pl.Float64)}
+    assert df.rows() == [([], [])]
+
     # Mixed dtypes
     df = pl.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
     assert df.shape == (3, 2)
@@ -75,7 +94,7 @@ def test_init_dict() -> None:
     assert df.dtypes == [pl.Int64, pl.Float64]
 
     df = pl.DataFrame(
-        {"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]},
+        data={"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]},
         columns=[("a", pl.Int8), ("b", pl.Float32)],
     )
     assert df.schema == {"a": pl.Int8, "b": pl.Float32}
@@ -83,6 +102,30 @@ def test_init_dict() -> None:
     # Values contained in tuples
     df = pl.DataFrame({"a": (1, 2, 3), "b": [1.0, 2.0, 3.0]})
     assert df.shape == (3, 2)
+
+    # Datetime/Date types (from both python and integer values)
+    py_datetimes = (
+        datetime(2022, 12, 31, 23, 59, 59),
+        datetime(2022, 12, 31, 23, 59, 59),
+    )
+    py_dates = (date(2022, 12, 31), date(2022, 12, 31))
+    int_datetimes = [1672531199000000, 1672531199000000]
+    int_dates = [19357, 19357]
+
+    for dates, datetimes, coldefs in (
+        # test inferred and explicit (given both py/polars dtypes)
+        (py_dates, py_datetimes, None),
+        (py_dates, py_datetimes, [("dt", date), ("dtm", datetime)]),
+        (py_dates, py_datetimes, [("dt", pl.Date), ("dtm", pl.Datetime)]),
+        (int_dates, int_datetimes, [("dt", date), ("dtm", datetime)]),
+        (int_dates, int_datetimes, [("dt", pl.Date), ("dtm", pl.Datetime)]),
+    ):
+        df = pl.DataFrame(
+            data={"dt": dates, "dtm": datetimes},
+            columns=coldefs,
+        )
+        assert df.schema == {"dt": pl.Date, "dtm": pl.Datetime}
+        assert df.rows() == list(zip(py_dates, py_datetimes))
 
     # Overriding dict column names/types
     df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}, columns=["c", "d"])
@@ -728,27 +771,29 @@ def test_hstack_list_of_series(
     stack: list, exp_shape: tuple, exp_columns: list, in_place: bool
 ) -> None:
     df = pl.DataFrame({"a": [2, 1, 3], "b": ["a", "b", "c"]})
-    df_out = df.hstack(stack, in_place=in_place)
     if in_place:
+        df.hstack(stack, in_place=True)
         assert df.shape == exp_shape
         assert df.columns == exp_columns
     else:
-        assert df_out.shape == exp_shape  # type: ignore
-        assert df_out.columns == exp_columns  # type: ignore
+        df_out = df.hstack(stack, in_place=False)
+        assert df_out.shape == exp_shape
+        assert df_out.columns == exp_columns
 
 
 @pytest.mark.parametrize("in_place", [True, False])
 def test_hstack_dataframe(in_place: bool) -> None:
     df = pl.DataFrame({"a": [2, 1, 3], "b": ["a", "b", "c"]})
     df2 = pl.DataFrame({"c": [2, 1, 3], "d": ["a", "b", "c"]})
-    df_out = df.hstack(df2, in_place=in_place)
     expected = pl.DataFrame(
         {"a": [2, 1, 3], "b": ["a", "b", "c"], "c": [2, 1, 3], "d": ["a", "b", "c"]}
     )
     if in_place:
+        df.hstack(df2, in_place=True)
         assert df.frame_equal(expected)
     else:
-        assert df_out.frame_equal(expected)  # type: ignore
+        df_out = df.hstack(df2, in_place=False)
+        assert df_out.frame_equal(expected)
 
 
 @pytest.mark.parametrize("in_place", [True, False])
@@ -839,6 +884,18 @@ def test_file_buffer() -> None:
     with pytest.raises(pl.ArrowError) as e:
         pl.read_parquet(f)
     assert "Invalid Parquet file" in str(e.value)
+
+
+def test_read_missing_file() -> None:
+    with pytest.raises(FileNotFoundError, match="fake_parquet_file"):
+        pl.read_parquet("fake_parquet_file")
+
+    with pytest.raises(FileNotFoundError, match="fake_csv_file"):
+        pl.read_csv("fake_csv_file")
+
+    with pytest.raises(FileNotFoundError, match="fake_csv_file"):
+        with open("fake_csv_file", "r") as f:
+            pl.read_csv(f)
 
 
 def test_set() -> None:
@@ -1077,10 +1134,10 @@ def test_column_names() -> None:
 
 def test_lazy_functions() -> None:
     df = pl.DataFrame({"a": ["foo", "bar", "2"], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
-    out = df[[pl.count("a")]]
+    out = df.select([pl.count("a")])
     assert out["a"] == 3
     assert pl.count(df["a"]) == 3
-    out = df[
+    out = df.select(
         [
             pl.var("b").alias("1"),
             pl.std("b").alias("2"),
@@ -1093,7 +1150,7 @@ def test_lazy_functions() -> None:
             pl.first("b").alias("9"),
             pl.last("b").alias("10"),
         ]
-    ]
+    )
     expected = 1.0
     assert np.isclose(out.select_at_idx(0), expected)
     assert np.isclose(pl.var(df["b"]), expected)  # type: ignore
@@ -1200,11 +1257,11 @@ def test_to_numpy() -> None:
 
 
 def test_argsort_by(df: pl.DataFrame) -> None:
-    a = df[pl.argsort_by(["int_nulls", "floats"], reverse=[False, True])]["int_nulls"]
-    assert a == [1, 0, 3]
+    idx_df = df.select(pl.argsort_by(["int_nulls", "floats"], reverse=[False, True]))
+    assert idx_df["int_nulls"] == [1, 0, 3]
 
-    a = df[pl.argsort_by(["int_nulls", "floats"], reverse=False)]["int_nulls"]
-    assert a == [1, 0, 2]
+    idx_df = df.select(pl.argsort_by(["int_nulls", "floats"], reverse=False))
+    assert idx_df["int_nulls"] == [1, 0, 2]
 
 
 def test_literal_series() -> None:
@@ -1280,7 +1337,7 @@ def test_from_rows() -> None:
 def test_repeat_by() -> None:
     df = pl.DataFrame({"name": ["foo", "bar"], "n": [2, 3]})
 
-    out = df[pl.col("n").repeat_by("n")]
+    out = df.select(pl.col("n").repeat_by("n"))
     s = out["n"]
     assert s[0] == [2, 2]
     assert s[1] == [3, 3, 3]
@@ -1343,23 +1400,38 @@ def dot_product() -> None:
     df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [2, 2, 2, 2]})
 
     assert df["a"].dot(df["b"]) == 20
-    assert df[[pl.col("a").dot("b")]][0, "a"] == 20
+    assert df.select([pl.col("a").dot("b")])[0, "a"] == 20
 
 
 def test_hash_rows() -> None:
     df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [2, 2, 2, 2]})
     assert df.hash_rows().dtype == pl.UInt64
     assert df["a"].hash().dtype == pl.UInt64
-    assert df[[pl.col("a").hash().alias("foo")]]["foo"].dtype == pl.UInt64
+    assert df.select([pl.col("a").hash().alias("foo")])["foo"].dtype == pl.UInt64
 
 
 def test_create_df_from_object() -> None:
     class Foo:
-        def __init__(self) -> None:
-            pass
+        def __init__(self, value: int) -> None:
+            self._value = value
 
-    df = pl.DataFrame({"a": [Foo(), Foo()]})
+        def __eq__(self, other: Any) -> bool:
+            return issubclass(other.__class__, self.__class__) and (
+                self._value == other._value
+            )
+
+        def __repr__(self) -> str:
+            return f"{self.__class__.__name__}({self._value})"
+
+    # from miscellaneous object
+    df = pl.DataFrame({"a": [Foo(1), Foo(2)]})
     assert df["a"].dtype == pl.Object
+    assert df.rows() == [(Foo(1),), (Foo(2),)]
+
+    # from mixed-type input
+    df = pl.DataFrame({"x": [["abc", 12, 34.5]], "y": [1]})
+    assert df.schema == {"x": pl.Object, "y": pl.Int64}
+    assert df.rows() == [(["abc", 12, 34.5], 1)]
 
 
 def test_hashing_on_python_objects() -> None:
@@ -1517,7 +1589,7 @@ def test_filter_with_all_expansion() -> None:
             "a": [None, None, None],
         }
     )
-    out = df.filter(~pl.fold(True, lambda acc, s: acc & s.is_null(), pl.all()))  # type: ignore
+    out = df.filter(~pl.fold(True, lambda acc, s: acc & s.is_null(), pl.all()))
     assert out.shape == (2, 3)
 
 
@@ -1673,6 +1745,29 @@ def test_rename_swap() -> None:
     assert out.frame_equal(expected)
 
 
+def test_rename_same_name() -> None:
+    df = pl.DataFrame(
+        {
+            "nrs": [1, 2, 3, 4, 5],
+            "groups": ["A", "A", "B", "C", "B"],
+        }
+    ).lazy()
+    df = df.rename({"groups": "groups"})
+    df = df.select(["groups"])
+    assert df.collect().to_dict(False) == {"groups": ["A", "A", "B", "C", "B"]}
+    df = pl.DataFrame(
+        {
+            "nrs": [1, 2, 3, 4, 5],
+            "groups": ["A", "A", "B", "C", "B"],
+            "test": [1, 2, 3, 4, 5],
+        }
+    ).lazy()
+    df = df.rename({"nrs": "nrs", "groups": "groups"})
+    df = df.select(["groups"])
+    df.collect()
+    assert df.collect().to_dict(False) == {"groups": ["A", "A", "B", "C", "B"]}
+
+
 def test_fill_null() -> None:
     df = pl.DataFrame({"a": [1, 2], "b": [3, None]})
     assert df.fill_null(4).frame_equal(pl.DataFrame({"a": [1, 2], "b": [3, 4]}))
@@ -1733,9 +1828,9 @@ def test_shrink_to_fit(in_place: bool) -> None:
     df = pl.DataFrame({"foo": [1, 2, 3], "bar": [6, 7, 8], "ham": ["a", "b", "c"]})
 
     if in_place:
-        assert df.shrink_to_fit(in_place) is None
+        assert df.shrink_to_fit(typing.cast(Literal[True], in_place)) is None
     else:
-        assert df.shrink_to_fit(in_place).frame_equal(df)  # type: ignore
+        assert df.shrink_to_fit(typing.cast(Literal[False], in_place)).frame_equal(df)
 
 
 def test_arithmetic() -> None:
@@ -1793,7 +1888,7 @@ def test_arithmetic() -> None:
     )
     assert out.frame_equal(expected, null_equal=True)
 
-    # cannot do arithmetics with a sequence
+    # cannot do arithmetic with a sequence
     with pytest.raises(ValueError, match="Operation not supported"):
         _ = df + [1]  # type: ignore
 
@@ -1821,7 +1916,7 @@ def test_get_item() -> None:
     df = pl.DataFrame({"a": [1.0, 2.0], "b": [3, 4]})
 
     # expression
-    assert df[pl.col("a")].frame_equal(pl.DataFrame({"a": [1.0, 2.0]}))
+    assert df.select(pl.col("a")).frame_equal(pl.DataFrame({"a": [1.0, 2.0]}))
 
     # numpy array
     assert df[np.array([True, False])].frame_equal(pl.DataFrame({"a": [1.0], "b": [3]}))
@@ -1854,7 +1949,7 @@ def test_get_item() -> None:
     # if bools, assumed to be a row mask
     # if integers, assumed to be row indices
     assert df[["a", "b"]].frame_equal(df)
-    assert df[[pl.col("a"), pl.col("b")]].frame_equal(df)
+    assert df.select([pl.col("a"), pl.col("b")]).frame_equal(df)
     df[[1]].frame_equal(pl.DataFrame({"a": [1.0], "b": [3]}))
     df[[False, True]].frame_equal(pl.DataFrame({"a": [1.0], "b": [3]}))
 
@@ -2029,7 +2124,7 @@ def test_explode_empty() -> None:
 
     df = pl.DataFrame(dict(x=["1", "2", "4"], y=[["a", "b", "c"], ["d"], []]))
     assert df.explode("y").frame_equal(
-        pl.DataFrame({"x": ["1", "1", "1", "2"], "y": ["a", "b", "c", "d"]})
+        pl.DataFrame({"x": ["1", "1", "1", "2", "4"], "y": ["a", "b", "c", "d", None]})
     )
 
 
@@ -2082,6 +2177,16 @@ def test_partition_by() -> None:
         {"foo": ["C"], "N": [2], "bar": ["l"]},
     ]
 
+    df = pl.DataFrame({"a": ["one", "two", "one", "two"], "b": [1, 2, 3, 4]})
+    assert df.partition_by(["a", "b"], as_dict=True)["one", 1].to_dict(False) == {
+        "a": ["one"],
+        "b": [1],
+    }
+    assert df.partition_by(["a"], as_dict=True)["one"].to_dict(False) == {
+        "a": ["one", "one"],
+        "b": [1, 3],
+    }
+
 
 @typing.no_type_check
 def test_list_of_list_of_struct() -> None:
@@ -2090,3 +2195,44 @@ def test_list_of_list_of_struct() -> None:
     df = pl.from_arrow(pa_df)
     assert df.rows() == [([[{"a": 1}, {"a": 2}]],)]
     assert df.to_dicts() == expected
+
+
+def test_concat_to_empty() -> None:
+    assert pl.concat([pl.DataFrame([]), pl.DataFrame({"a": [1]})]).to_dict(False) == {
+        "a": [1]
+    }
+
+
+def test_fill_null_limits() -> None:
+    assert pl.DataFrame(
+        {
+            "a": [1, None, None, None, 5, 6, None, None, None, 10],
+            "b": ["a", None, None, None, "b", "c", None, None, None, "d"],
+            "c": [True, None, None, None, False, True, None, None, None, False],
+        }
+    ).select(
+        [
+            pl.all().fill_null("forward", limit=2),
+            pl.all().fill_null("backward", limit=2).suffix("_backward"),
+        ]
+    ).to_dict(
+        False
+    ) == {
+        "a": [1, 1, 1, None, 5, 6, 6, 6, None, 10],
+        "b": ["a", "a", "a", None, "b", "c", "c", "c", None, "d"],
+        "c": [True, True, True, None, False, True, True, True, None, False],
+        "a_backward": [1, None, 5, 5, 5, 6, None, 10, 10, 10],
+        "b_backward": ["a", None, "b", "b", "b", "c", None, "d", "d", "d"],
+        "c_backward": [
+            True,
+            None,
+            False,
+            False,
+            False,
+            True,
+            None,
+            False,
+            False,
+            False,
+        ],
+    }

@@ -16,7 +16,6 @@ use crate::frame::hash_join::{check_categorical_src, ZipOuterJoinColumn};
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
 use ahash::RandomState;
-use arrow::array::ArrayRef;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use std::borrow::Cow;
 
@@ -73,7 +72,7 @@ impl private::PrivateSeries for SeriesWrap<CategoricalChunked> {
         .into_series()
     }
 
-    fn set_sorted(&mut self, reverse: bool) {
+    fn _set_sorted(&mut self, reverse: bool) {
         self.0.logical_mut().set_sorted(reverse)
     }
 
@@ -99,7 +98,7 @@ impl private::PrivateSeries for SeriesWrap<CategoricalChunked> {
         self.0.logical().vec_hash_combine(build_hasher, hashes)
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         // we cannot cast and dispatch as the inner type of the list would be incorrect
         self.0
             .logical()
@@ -115,7 +114,8 @@ impl private::PrivateSeries for SeriesWrap<CategoricalChunked> {
     ) -> Series {
         let new_rev_map = self
             .0
-            .merge_categorical_map(right_column.categorical().unwrap());
+            .merge_categorical_map(right_column.categorical().unwrap())
+            .unwrap();
         let left = self.0.logical();
         let right = right_column
             .categorical()
@@ -173,21 +173,6 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
         self.0.logical_mut().shrink_to_fit()
     }
 
-    fn categorical(&self) -> Result<&CategoricalChunked> {
-        if matches!(self.0.dtype(), DataType::Categorical(_)) {
-            unsafe { Ok(&*(self as *const dyn SeriesTrait as *const CategoricalChunked)) }
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                format!(
-                    "cannot unpack Series: {:?} of type {:?} into categorical",
-                    self.name(),
-                    self.dtype(),
-                )
-                .into(),
-            ))
-        }
-    }
-
     fn append_array(&mut self, other: ArrayRef) -> Result<()> {
         self.0.logical_mut().append_array(other)
     }
@@ -210,7 +195,7 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
         if self.0.dtype() == other.dtype() {
             let other = other.categorical()?;
             self.0.logical_mut().extend(other.logical());
-            let new_rev_map = self.0.merge_categorical_map(other);
+            let new_rev_map = self.0.merge_categorical_map(other)?;
             self.0.set_rev_map(new_rev_map, false);
             Ok(())
         } else {
@@ -226,8 +211,8 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-        let cats = self.0.logical().take_chunked_unchecked(by);
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+        let cats = self.0.logical().take_chunked_unchecked(by, sorted);
         self.finish_with_state(false, cats).into_series()
     }
 

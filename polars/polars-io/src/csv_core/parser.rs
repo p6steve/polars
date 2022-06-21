@@ -89,11 +89,16 @@ where
 /// and not with
 ///     '\nfield_1,field_1'
 pub(crate) fn skip_header(input: &[u8]) -> (&[u8], usize) {
-    let mut pos = next_line_position_naive(input).expect("no lines in the file");
-    if input[pos] == b'\n' {
-        pos += 1;
+    match next_line_position_naive(input) {
+        Some(mut pos) => {
+            if input[pos] == b'\n' {
+                pos += 1;
+            }
+            (&input[pos..], pos)
+        }
+        // no lines in the file, so skipping the header is skipping all.
+        None => (&[], input.len()),
     }
-    (&input[pos..], pos)
 }
 
 /// Remove whitespace from the start of buffer.
@@ -481,11 +486,13 @@ pub(crate) fn parse_lines(
                                     let unparsable = String::from_utf8_lossy(field);
                                     PolarsError::ComputeError(
                                         format!(
-                                            r#"Could not parse {} as dtype {:?} at column {}.
-                                            The total offset in the file is {} bytes.
-
-                                            Consider running the parser `with_ignore_parser_errors=true`
-                                            or consider adding {} to the `null_values` list."#,
+                                            "Could not parse `{}` as dtype {:?} at column {}.\n\
+                                            The current offset in the file is {} bytes.\n\
+                                            \n\
+                                            Consider specifying the correct dtype, increasing\n\
+                                            the number of records used to infer the schema,\n\
+                                            running the parser with `ignore_parser_errors=true`\n\
+                                            or  adding `{}` to the `null_values` list.",
                                             &unparsable,
                                             buf.dtype(),
                                             idx,

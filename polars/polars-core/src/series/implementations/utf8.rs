@@ -16,7 +16,6 @@ use crate::frame::hash_join::ZipOuterJoinColumn;
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
 use ahash::RandomState;
-use arrow::array::ArrayRef;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use std::borrow::Cow;
 
@@ -37,7 +36,7 @@ impl private::PrivateSeries for SeriesWrap<Utf8Chunked> {
         self.0.explode_by_offsets(offsets)
     }
 
-    fn set_sorted(&mut self, reverse: bool) {
+    fn _set_sorted(&mut self, reverse: bool) {
         self.0.set_sorted(reverse)
     }
 
@@ -64,7 +63,7 @@ impl private::PrivateSeries for SeriesWrap<Utf8Chunked> {
         self.0.vec_hash_combine(build_hasher, hashes)
     }
 
-    fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_list(groups)
     }
 
@@ -134,21 +133,6 @@ impl SeriesTrait for SeriesWrap<Utf8Chunked> {
         self.0.shrink_to_fit()
     }
 
-    fn utf8(&self) -> Result<&Utf8Chunked> {
-        if matches!(self.0.dtype(), DataType::Utf8) {
-            unsafe { Ok(&*(self as *const dyn SeriesTrait as *const Utf8Chunked)) }
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                format!(
-                    "cannot unpack Series: {:?} of type {:?} into utf8",
-                    self.name(),
-                    self.dtype(),
-                )
-                .into(),
-            ))
-        }
-    }
-
     fn append_array(&mut self, other: ArrayRef) -> Result<()> {
         self.0.append_array(other)
     }
@@ -185,8 +169,8 @@ impl SeriesTrait for SeriesWrap<Utf8Chunked> {
     }
 
     #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId]) -> Series {
-        self.0.take_chunked_unchecked(by).into_series()
+    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
+        self.0.take_chunked_unchecked(by, sorted).into_series()
     }
 
     #[cfg(feature = "chunked_ids")]
@@ -221,7 +205,14 @@ impl SeriesTrait for SeriesWrap<Utf8Chunked> {
         } else {
             Cow::Borrowed(idx)
         };
-        Ok(ChunkTake::take_unchecked(&self.0, (&*idx).into()).into_series())
+
+        let mut out = ChunkTake::take_unchecked(&self.0, (&*idx).into()).into_series();
+
+        if self.0.is_sorted() && (idx.is_sorted() || idx.is_sorted_reverse()) {
+            out.set_sorted(idx.is_sorted_reverse())
+        }
+
+        Ok(out)
     }
 
     unsafe fn take_opt_iter_unchecked(&self, iter: &mut dyn TakeIteratorNulls) -> Series {

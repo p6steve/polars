@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
+import pytz
 from test_series import verify_series_and_expr_api
 
 import polars as pl
@@ -156,11 +157,12 @@ def test_timezone() -> None:
     # with timezone; we do expect a warning here
     tz_ts = pa.timestamp("s", tz="America/New_York")
     tz_data = pa.array([1000, 2000], type=tz_ts)
-    with pytest.warns(Warning):
-        tz_s: pl.Series = pl.from_arrow(tz_data)  # type: ignore
+    # with pytest.warns(Warning):
+    tz_s: pl.Series = pl.from_arrow(tz_data)  # type: ignore
 
     # timezones have no effect, i.e. `s` equals `tz_s`
-    assert s.series_equal(tz_s)
+    assert not s.series_equal(tz_s)
+    assert s.cast(int).series_equal(tz_s.cast(int))
 
 
 def test_to_list() -> None:
@@ -451,7 +453,7 @@ def test_upsample() -> None:
             "admin": ["Åland", "Netherlands", "Åland", "Netherlands"],
             "test2": [0, 1, 2, 3],
         }
-    )
+    ).with_column(pl.col("time").dt.with_time_zone("UTC"))
 
     up = df.upsample(
         time_column="time", every="1mo", by="admin", maintain_order=True
@@ -479,7 +481,7 @@ def test_upsample() -> None:
             ],
             "test2": [0, 0, 0, 2, 1, 1, 3],
         }
-    )
+    ).with_column(pl.col("time").dt.with_time_zone("UTC"))
 
     assert up.frame_equal(expected)
 
@@ -527,7 +529,8 @@ def test_read_utc_times_parquet() -> None:
     df.to_parquet(f)
     f.seek(0)
     df_in = pl.read_parquet(f)
-    assert df_in["Timestamp"][0] == datetime(2022, 1, 1, 0, 0)
+    tz = pytz.timezone("UTC")
+    assert df_in["Timestamp"][0] == tz.localize(datetime(2022, 1, 1, 0, 0))
 
 
 def test_epoch() -> None:
@@ -873,3 +876,177 @@ def test_datetime_strptime_patterns() -> None:
     )["parsed"]
     assert s.null_count() == 1
     assert s[0] is None
+
+
+def test_timedelta_from() -> None:
+    as_dict = {
+        "A": [1, 2],
+        "B": [timedelta(seconds=4633), timedelta(seconds=50)],
+    }
+    as_rows = [
+        {
+            "A": 1,
+            "B": timedelta(seconds=4633),
+        },
+        {
+            "A": 2,
+            "B": timedelta(seconds=50),
+        },
+    ]
+    assert pl.DataFrame(as_dict).frame_equal(pl.DataFrame(as_rows))
+
+
+def test_duration_aggregations() -> None:
+    df = pl.DataFrame(
+        {
+            "group": ["A", "B", "A", "B"],
+            "start": [
+                datetime(2022, 1, 1),
+                datetime(2022, 1, 2),
+                datetime(2022, 1, 3),
+                datetime(2022, 1, 4),
+            ],
+            "end": [
+                datetime(2022, 1, 2),
+                datetime(2022, 1, 4),
+                datetime(2022, 1, 6),
+                datetime(2022, 1, 6),
+            ],
+        }
+    )
+    df = df.with_column((pl.col("end") - pl.col("start")).alias("duration"))
+    assert df.groupby("group", maintain_order=True).agg(
+        [
+            pl.col("duration").mean().alias("mean"),
+            pl.col("duration").sum().alias("sum"),
+            pl.col("duration").min().alias("min"),
+            pl.col("duration").max().alias("max"),
+            pl.col("duration").quantile(0.1).alias("quantile"),
+            pl.col("duration").median().alias("median"),
+            pl.col("duration").list().alias("list"),
+        ]
+    ).to_dict(False) == {
+        "group": ["A", "B"],
+        "mean": [timedelta(days=2), timedelta(days=2)],
+        "sum": [timedelta(days=4), timedelta(days=4)],
+        "min": [timedelta(days=1), timedelta(days=2)],
+        "max": [timedelta(days=3), timedelta(days=2)],
+        "quantile": [timedelta(days=1), timedelta(days=2)],
+        "median": [timedelta(days=2), timedelta(days=2)],
+        "list": [
+            [timedelta(days=1), timedelta(days=3)],
+            [timedelta(days=2), timedelta(days=2)],
+        ],
+    }
+
+
+def test_datetime_units() -> None:
+    df = pl.DataFrame(
+        {
+            "ns": pl.date_range(
+                datetime(2020, 1, 1), datetime(2020, 5, 1), "1mo", time_unit="ns"
+            ),
+            "us": pl.date_range(
+                datetime(2020, 1, 1), datetime(2020, 5, 1), "1mo", time_unit="us"
+            ),
+            "ms": pl.date_range(
+                datetime(2020, 1, 1), datetime(2020, 5, 1), "1mo", time_unit="ms"
+            ),
+        }
+    )
+    names = set(df.columns)
+
+    for unit in ["ns", "us", "ms"]:
+        subset = names - set([unit])
+
+        assert (
+            len(set(df.select([pl.all().exclude(pl.Datetime(unit))]).columns) - subset)
+            == 0
+        )
+
+
+def test_datetime_instance_selection() -> None:
+    df = pl.DataFrame(
+        data={
+            "ns": [datetime(2022, 12, 31, 1, 2, 3)],
+            "us": [datetime(2022, 12, 31, 4, 5, 6)],
+            "ms": [datetime(2022, 12, 31, 7, 8, 9)],
+        },
+        columns=[
+            ("ns", pl.Datetime("ns")),
+            ("us", pl.Datetime("us")),
+            ("ms", pl.Datetime("ms")),
+        ],
+    )
+
+    for tu in ["ns", "us", "ms"]:
+        assert df.select(pl.col([pl.Datetime(tu)])).dtypes == [pl.Datetime(tu)]
+
+
+def test_unique_counts_on_dates() -> None:
+    assert pl.DataFrame(
+        {
+            "dt_ns": pl.date_range(datetime(2020, 1, 1), datetime(2020, 3, 1), "1mo"),
+        }
+    ).with_columns(
+        [
+            pl.col("dt_ns").dt.cast_time_unit("us").alias("dt_us"),
+            pl.col("dt_ns").dt.cast_time_unit("ms").alias("dt_ms"),
+            pl.col("dt_ns").cast(pl.Date).alias("date"),
+        ]
+    ).select(
+        pl.all().unique_counts().sum()
+    ).to_dict(
+        False
+    ) == {
+        "dt_ns": [3],
+        "dt_us": [3],
+        "dt_ms": [3],
+        "date": [3],
+    }
+
+
+def test_groupby_rolling_by_ordering() -> None:
+    # we must check that the keys still match the time labels after the rolling window
+    # with a `by` argument.
+    df = pl.DataFrame(
+        {
+            "dt": [
+                datetime(2022, 1, 1, 0, 1),
+                datetime(2022, 1, 1, 0, 2),
+                datetime(2022, 1, 1, 0, 3),
+                datetime(2022, 1, 1, 0, 4),
+                datetime(2022, 1, 1, 0, 5),
+                datetime(2022, 1, 1, 0, 6),
+                datetime(2022, 1, 1, 0, 7),
+            ],
+            "key": ["A", "A", "B", "B", "A", "B", "A"],
+            "val": [1, 1, 1, 1, 1, 1, 1],
+        }
+    )
+
+    assert df.groupby_rolling(
+        index_column="dt",
+        period="2m",
+        closed="both",
+        offset="-1m",
+        by="key",
+    ).agg(
+        [
+            pl.col("val").sum().alias("sum val"),
+        ]
+    ).to_dict(
+        False
+    ) == {
+        "key": ["A", "A", "B", "B", "A", "B", "A"],
+        "dt": [
+            datetime(2022, 1, 1, 0, 1),
+            datetime(2022, 1, 1, 0, 2),
+            datetime(2022, 1, 1, 0, 3),
+            datetime(2022, 1, 1, 0, 4),
+            datetime(2022, 1, 1, 0, 5),
+            datetime(2022, 1, 1, 0, 6),
+            datetime(2022, 1, 1, 0, 7),
+        ],
+        "sum val": [2, 2, 2, 2, 1, 1, 1],
+    }

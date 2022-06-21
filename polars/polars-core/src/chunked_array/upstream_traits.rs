@@ -1,5 +1,7 @@
 //! Implementations of upstream traits for ChunkedArray<T>
-use crate::chunked_array::builder::{get_list_builder, AnonymousListBuilder};
+use crate::chunked_array::builder::{
+    get_list_builder, AnonymousListBuilder, AnonymousOwnedListBuilder,
+};
 #[cfg(feature = "object")]
 use crate::chunked_array::object::ObjectArray;
 use crate::prelude::*;
@@ -58,7 +60,7 @@ where
                 .collect::<PrimitiveArray<T::Native>>()
                 .to(T::get_dtype().to_arrow()),
         };
-        ChunkedArray::from_chunks("", vec![Arc::new(arr)])
+        ChunkedArray::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -79,7 +81,7 @@ where
 impl FromIterator<Option<bool>> for ChunkedArray<BooleanType> {
     fn from_iter<I: IntoIterator<Item = Option<bool>>>(iter: I) -> Self {
         let arr = BooleanArray::from_iter(iter);
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -87,7 +89,7 @@ impl FromIterator<bool> for BooleanChunked {
     fn from_iter<I: IntoIterator<Item = bool>>(iter: I) -> Self {
         // 2021-02-07: this was ~70% faster than with the builder, even with the extra Option<T> added.
         let arr = BooleanArray::from_iter(iter.into_iter().map(Some));
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -106,7 +108,7 @@ where
 {
     fn from_iter<I: IntoIterator<Item = Option<Ptr>>>(iter: I) -> Self {
         let arr = Utf8Array::<i64>::from_iter(iter);
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -125,7 +127,7 @@ where
 {
     fn from_iter<I: IntoIterator<Item = Ptr>>(iter: I) -> Self {
         let arr = Utf8Array::<i64>::from_iter_values(iter.into_iter());
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -143,7 +145,8 @@ where
             None => return ListChunked::full_null("", 0),
         };
         // We don't know the needed capacity. We arbitrarily choose an average of 5 elements per series.
-        let mut builder = get_list_builder(v.borrow().dtype(), capacity * 5, capacity, "collected");
+        let mut builder =
+            get_list_builder(v.borrow().dtype(), capacity * 5, capacity, "collected").unwrap();
 
         builder.append_series(v.borrow());
         for s in it {
@@ -155,42 +158,85 @@ where
 
 impl FromIterator<Option<Series>> for ListChunked {
     fn from_iter<I: IntoIterator<Item = Option<Series>>>(iter: I) -> Self {
-        let mut cap = 0;
-        let mut dtype = None;
-        let vals = iter
-            .into_iter()
-            .map(|opt_s| {
-                opt_s.map(|s| {
-                    if dtype.is_none() {
-                        dtype = Some(s.dtype().clone());
+        let mut it = iter.into_iter();
+        let capacity = get_iter_capacity(&it);
+
+        // get first non None from iter
+        let first_value;
+        let mut init_null_count = 0;
+        loop {
+            match it.next() {
+                Some(Some(s)) => {
+                    first_value = Some(s);
+                    break;
+                }
+                Some(None) => {
+                    init_null_count += 1;
+                }
+                None => return ListChunked::full_null("", 0),
+            }
+        }
+
+        match first_value {
+            None => {
+                // already returned full_null above
+                unreachable!()
+            }
+            Some(ref first_s) => {
+                // AnyValues with empty lists in python can create
+                // Series of an unknown dtype.
+                // We use the anonymousbuilder without a dtype
+                // the empty arrays is then not added (we add an extra offset instead)
+                // the next non-empty series then must have the correct dtype.
+                if matches!(first_s.dtype(), DataType::Null) && first_s.is_empty() {
+                    let mut builder = AnonymousOwnedListBuilder::new("collected", capacity, None);
+                    for _ in 0..init_null_count {
+                        builder.append_null();
                     }
-                    cap += s.len();
-                    s
-                })
-            })
-            .collect::<Vec<_>>();
+                    builder.append_empty();
 
-        match &dtype {
-            // TODO: test if this can be removed
-            #[cfg(feature = "object")]
-            Some(DataType::Object(_)) => {
-                let s = vals.iter().find_map(|opt_s| opt_s.as_ref()).unwrap();
-                {
-                    let mut builder = s.get_list_builder("collected", cap * 5, cap);
-
-                    for val in &vals {
-                        builder.append_opt_series(val.as_ref());
+                    for opt_s in it {
+                        builder.append_opt_series(opt_s.as_ref());
                     }
                     builder.finish()
+                } else {
+                    match first_s.dtype() {
+                        #[cfg(feature = "object")]
+                        DataType::Object(_) => {
+                            let mut builder =
+                                first_s.get_list_builder("collected", capacity * 5, capacity);
+                            for _ in 0..init_null_count {
+                                builder.append_null();
+                            }
+                            builder.append_series(first_s);
+
+                            for opt_s in it {
+                                builder.append_opt_series(opt_s.as_ref());
+                            }
+                            builder.finish()
+                        }
+                        _ => {
+                            // We don't know the needed capacity. We arbitrarily choose an average of 5 elements per series.
+                            let mut builder = get_list_builder(
+                                first_s.dtype(),
+                                capacity * 5,
+                                capacity,
+                                "collected",
+                            )
+                            .unwrap();
+
+                            for _ in 0..init_null_count {
+                                builder.append_null();
+                            }
+                            builder.append_series(first_s);
+
+                            for opt_s in it {
+                                builder.append_opt_series(opt_s.as_ref());
+                            }
+                            builder.finish()
+                        }
+                    }
                 }
-            }
-            _ => {
-                let mut builder =
-                    AnonymousListBuilder::new("collected", cap, dtype.unwrap_or(DataType::Int32));
-                for val in &vals {
-                    builder.append_opt_series(val.as_ref());
-                }
-                builder.finish()
             }
         }
     }
@@ -213,8 +259,7 @@ impl FromIterator<Option<Box<dyn Array>>> for ListChunked {
             })
             .collect::<Vec<_>>();
 
-        let mut builder =
-            AnonymousListBuilder::new("collected", cap, dtype.unwrap_or(DataType::Int32));
+        let mut builder = AnonymousListBuilder::new("collected", cap, None);
         for val in &vals {
             builder.append_opt_array(val.as_deref());
         }
@@ -250,7 +295,7 @@ impl<T: PolarsObject> FromIterator<Option<T>> for ObjectChunked<T> {
 
         let len = values.len();
 
-        let arr = Arc::new(ObjectArray {
+        let arr = Box::new(ObjectArray {
             values: Arc::new(values),
             null_bitmap,
             offset: 0,
@@ -332,7 +377,7 @@ where
         let iter = TrustMyLength::new(vectors.into_iter().flatten(), capacity);
         let arr =
             PrimitiveArray::<T::Native>::from_trusted_len_iter(iter).to(T::get_dtype().to_arrow());
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -347,7 +392,7 @@ impl FromParallelIterator<bool> for BooleanChunked {
                 vectors.into_iter().flatten().trust_my_length(capacity),
             )
         };
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -358,7 +403,7 @@ where
     fn from_par_iter<I: IntoParallelIterator<Item = Ptr>>(iter: I) -> Self {
         let vectors = collect_into_linked_list(iter);
         let arr = LargeStringArray::from_iter_values(vectors.into_iter().flatten());
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -369,7 +414,7 @@ where
     fn from_par_iter<I: IntoParallelIterator<Item = Option<Ptr>>>(iter: I) -> Self {
         let vectors = collect_into_linked_list(iter);
         let arr = LargeStringArray::from_iter(vectors.into_iter().flatten());
-        Self::from_chunks("", vec![Arc::new(arr)])
+        Self::from_chunks("", vec![Box::new(arr)])
     }
 }
 
@@ -415,21 +460,27 @@ impl FromParallelIterator<Option<Series>> for ListChunked {
         I: IntoParallelIterator<Item = Option<Series>>,
     {
         let mut dtype = None;
-        let mut vectors = collect_into_linked_list(iter);
-        let capacity: usize = get_capacity_from_par_results(&vectors);
-        let mut builder = AnonymousListBuilder::new("collected", capacity, DataType::Int32);
-        for v in &mut vectors {
-            for val in v {
-                if let Some(s) = val {
-                    if dtype.is_none() {
-                        dtype = Some(s.dtype().clone());
-                    }
-                    builder.append_series(s);
-                } else {
-                    builder.append_null();
-                }
-            }
-        }
+        let vectors = collect_into_linked_list(iter);
+
+        let list_capacity: usize = get_capacity_from_par_results(&vectors);
+        let value_capacity = vectors
+            .iter()
+            .map(|list| {
+                list.iter()
+                    .map(|opt_s| {
+                        opt_s
+                            .as_ref()
+                            .map(|s| {
+                                if dtype.is_none() && !matches!(s.dtype(), DataType::Null) {
+                                    dtype = Some(s.dtype().clone())
+                                }
+                                s.len()
+                            })
+                            .unwrap_or(0)
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
 
         match &dtype {
             #[cfg(feature = "object")]
@@ -439,7 +490,7 @@ impl FromParallelIterator<Option<Series>> for ListChunked {
                     .flatten()
                     .find_map(|opt_s| opt_s.as_ref())
                     .unwrap();
-                let mut builder = s.get_list_builder("collected", capacity * 5, capacity);
+                let mut builder = s.get_list_builder("collected", value_capacity, list_capacity);
 
                 for v in vectors {
                     for val in v {
@@ -448,10 +499,17 @@ impl FromParallelIterator<Option<Series>> for ListChunked {
                 }
                 builder.finish()
             }
-            _ => {
-                builder.dtype = dtype.unwrap_or(DataType::Int32);
+            Some(dtype) => {
+                let mut builder =
+                    get_list_builder(dtype, value_capacity, list_capacity, "collected").unwrap();
+                for v in &vectors {
+                    for val in v {
+                        builder.append_opt_series(val.as_ref());
+                    }
+                }
                 builder.finish()
             }
+            None => ListChunked::full_null_with_dtype("collected", list_capacity, &DataType::Null),
         }
     }
 }

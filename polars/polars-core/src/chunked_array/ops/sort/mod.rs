@@ -19,6 +19,22 @@ use std::cmp::Ordering;
 use std::hint::unreachable_unchecked;
 use std::iter::FromIterator;
 
+#[inline]
+fn sort_cmp<T: PartialOrd + IsFloat>(a: &T, b: &T) -> Ordering {
+    if T::is_float() {
+        match (a.is_nan(), b.is_nan()) {
+            // safety: we checked nans
+            (false, false) => unsafe { a.partial_cmp(b).unwrap_unchecked() },
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+        }
+    } else {
+        // no floats, so we can compare unchecked
+        unsafe { a.partial_cmp(b).unwrap_unchecked() }
+    }
+}
+
 /// Reverse sorting when there are no nulls
 fn order_reverse<T: Ord>(a: &T, b: &T) -> Ordering {
     b.cmp(a)
@@ -43,16 +59,6 @@ fn order_default_flt<T: Float>(a: &T, b: &T) -> Ordering {
 
 fn order_reverse_flt<T: Float>(a: &T, b: &T) -> Ordering {
     order_default_flt(b, a)
-}
-
-/// Sort with null values, to reverse, swap the arguments.
-fn sort_with_nulls<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => a.partial_cmp(b).unwrap(),
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
 }
 
 fn sort_branch<T, Fd, Fr>(
@@ -163,10 +169,13 @@ where
             order_reverse,
         );
 
-        ChunkedArray::from_vec(ca.name(), vals)
+        let mut ca = ChunkedArray::from_vec(ca.name(), vals);
+        ca.set_sorted(options.descending);
+        ca
     } else {
         let null_count = ca.null_count();
         let len = ca.len();
+
         let mut vals = Vec::with_capacity(ca.len());
 
         if !options.nulls_last {
@@ -175,13 +184,8 @@ where
         }
 
         ca.downcast_iter().for_each(|arr| {
-            // safety: we know the iterators len
-            let iter = unsafe {
-                arr.iter()
-                    .filter_map(|v| v.copied())
-                    .trust_my_length(len - null_count)
-            };
-            vals.extend_trusted_len(iter);
+            let iter = arr.iter().filter_map(|v| v.copied());
+            vals.extend(iter);
         });
         let mut_slice = if options.nulls_last {
             &mut vals[..len - null_count]
@@ -591,6 +595,7 @@ pub(crate) fn prepare_argsort(
 #[cfg(test)]
 mod test {
     use crate::prelude::*;
+    use crate::series::ops::NullBehavior;
 
     #[test]
     fn test_argsort() {

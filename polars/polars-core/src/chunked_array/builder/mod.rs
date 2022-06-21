@@ -62,7 +62,7 @@ where
 {
     fn from_slice(name: &str, v: &[T::Native]) -> Self {
         let arr = PrimitiveArray::<T::Native>::from_slice(v).to(T::get_dtype().to_arrow());
-        ChunkedArray::from_chunks(name, vec![Arc::new(arr)])
+        ChunkedArray::from_chunks(name, vec![Box::new(arr)])
     }
 
     fn from_slice_options(name: &str, opt_v: &[Option<T::Native>]) -> Self {
@@ -127,7 +127,7 @@ where
 
         ChunkedArray {
             field,
-            chunks: vec![builder.into_arc()],
+            chunks: vec![builder.as_box()],
             phantom: PhantomData,
             categorical_map: None,
             ..Default::default()
@@ -146,7 +146,7 @@ where
 
         ChunkedArray {
             field,
-            chunks: vec![builder.into_arc()],
+            chunks: vec![builder.as_box()],
             phantom: PhantomData,
             categorical_map: None,
             ..Default::default()
@@ -186,7 +186,8 @@ mod test {
 
     #[test]
     fn test_list_builder() {
-        let mut builder = ListPrimitiveChunkedBuilder::<i32>::new("a", 10, 5, DataType::Int32);
+        let mut builder =
+            ListPrimitiveChunkedBuilder::<Int32Type>::new("a", 10, 5, DataType::Int32);
 
         // create a series containing two chunks
         let mut s1 = Int32Chunked::from_slice("a", &[1, 2, 3]).into_series();
@@ -212,7 +213,8 @@ mod test {
         assert_eq!(out.get(0).unwrap().len(), 6);
         assert_eq!(out.get(1).unwrap().len(), 3);
 
-        let mut builder = ListPrimitiveChunkedBuilder::<i32>::new("a", 10, 5, DataType::Int32);
+        let mut builder =
+            ListPrimitiveChunkedBuilder::<Int32Type>::new("a", 10, 5, DataType::Int32);
         builder.append_series(&s1);
         builder.append_null();
 

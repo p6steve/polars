@@ -23,7 +23,7 @@ where
     T: PolarsNumericType,
 {
     fn full_null(name: &str, length: usize) -> Self {
-        let arr = new_null_array(T::get_dtype().to_arrow(), length).into();
+        let arr = new_null_array(T::get_dtype().to_arrow(), length);
         ChunkedArray::from_chunks(name, vec![arr])
     }
 }
@@ -37,7 +37,7 @@ impl ChunkFull<bool> for BooleanChunked {
 
 impl ChunkFullNull for BooleanChunked {
     fn full_null(name: &str, length: usize) -> Self {
-        let arr = new_null_array(DataType::Boolean.to_arrow(), length).into();
+        let arr = new_null_array(DataType::Boolean.to_arrow(), length);
         BooleanChunked::from_chunks(name, vec![arr])
     }
 }
@@ -55,14 +55,15 @@ impl<'a> ChunkFull<&'a str> for Utf8Chunked {
 
 impl ChunkFullNull for Utf8Chunked {
     fn full_null(name: &str, length: usize) -> Self {
-        let arr = new_null_array(DataType::Utf8.to_arrow(), length).into();
+        let arr = new_null_array(DataType::Utf8.to_arrow(), length);
         Utf8Chunked::from_chunks(name, vec![arr])
     }
 }
 
 impl ChunkFull<&Series> for ListChunked {
     fn full(name: &str, value: &Series, length: usize) -> ListChunked {
-        let mut builder = get_list_builder(value.dtype(), value.len() * length, length, name);
+        let mut builder =
+            get_list_builder(value.dtype(), value.len() * length, length, name).unwrap();
         for _ in 0..length {
             builder.append_series(value)
         }
@@ -77,11 +78,7 @@ impl ChunkFullNull for ListChunked {
 }
 
 impl ListChunked {
-    pub(crate) fn full_null_with_dtype(
-        name: &str,
-        length: usize,
-        inner_dtype: &DataType,
-    ) -> ListChunked {
+    pub fn full_null_with_dtype(name: &str, length: usize, inner_dtype: &DataType) -> ListChunked {
         let arr = new_null_array(
             ArrowDataType::LargeList(Box::new(ArrowField::new(
                 "item",
@@ -89,8 +86,7 @@ impl ListChunked {
                 true,
             ))),
             length,
-        )
-        .into();
+        );
         ListChunked::from_chunks(name, vec![arr])
     }
 }

@@ -111,7 +111,7 @@ where
             new_values.into(),
             Some(validity.into()),
         );
-        Series::try_from((self.name(), Arc::new(arr) as ArrayRef)).unwrap()
+        Series::try_from((self.name(), Box::new(arr) as ArrayRef)).unwrap()
     }
 }
 
@@ -208,12 +208,21 @@ pub(crate) fn offsets_to_indexes(offsets: &[i64], capacity: usize) -> Vec<IdxSiz
 
     let mut count = 0;
     let mut last_idx = 0;
-    for &offset in &offsets[1..] {
-        while count < offset {
+    for offset in &offsets[1..] {
+        while count < *offset {
             count += 1;
             idx.push(last_idx)
         }
-        last_idx += 1;
+        // Safety:
+        // we started iterating from 1, so there is always a previous offset
+        // we take the pointer to the previous element and deref that to get
+        // the previous offset
+        unsafe {
+            let previous_offset = *(offset as *const i64).offset(-1);
+            if previous_offset != *offset {
+                last_idx += 1;
+            }
+        }
     }
     for _ in 0..(capacity - count as usize) {
         idx.push(last_idx);
@@ -237,22 +246,19 @@ impl ChunkExplode for ListChunked {
 
         // all empty
         if offsets[offsets.len() - 1] == 0 {
-            // Safety: empty dtype is correct
-            return unsafe {
-                Ok((
-                    Series::from_chunks_and_dtype_unchecked(
-                        self.name(),
-                        vec![values],
-                        &self.inner_dtype(),
-                    ),
-                    Buffer::from_slice(&[]),
-                ))
-            };
+            return Ok((
+                Series::new_empty(self.name(), &self.inner_dtype()),
+                vec![].into(),
+            ));
         }
 
         if !offsets.is_empty() {
             let offset = offsets[0];
-            values = Arc::from(values.slice(offset as usize, offsets[offsets.len() - 1] as usize));
+            // safety:
+            // we are in bounds
+            values = unsafe {
+                values.slice_unchecked(offset as usize, offsets[offsets.len() - 1] as usize)
+            };
         }
 
         let mut s = if ca.can_fast_explode() {
@@ -325,8 +331,7 @@ impl ChunkExplode for Utf8Chunked {
             .map(|t| t.0 as i64)
             .chain(std::iter::once(str_data.len() as i64));
 
-        // char_indices is TrustedLen
-        let offsets = unsafe { Buffer::from_trusted_len_iter_unchecked(chars) };
+        let offsets = Buffer::from_iter(chars);
 
         // the old bitmap doesn't fit on the exploded array, so we need to create a new one.
         let validity = if let Some(validity) = array.validity() {
@@ -355,7 +360,7 @@ impl ChunkExplode for Utf8Chunked {
             Utf8Array::<i64>::from_data_unchecked_default(offsets, values.clone(), validity)
         };
 
-        let new_arr = Arc::new(array) as ArrayRef;
+        let new_arr = Box::new(array) as ArrayRef;
 
         let s = Series::try_from((self.name(), new_arr)).unwrap();
         Ok((s, old_offsets))
@@ -369,7 +374,7 @@ mod test {
 
     #[test]
     fn test_explode_list() -> Result<()> {
-        let mut builder = get_list_builder(&DataType::Int32, 5, 5, "a");
+        let mut builder = get_list_builder(&DataType::Int32, 5, 5, "a")?;
 
         builder.append_series(&Series::new("", &[1, 2, 3, 3]));
         builder.append_series(&Series::new("", &[1]));
@@ -419,7 +424,7 @@ mod test {
 
     #[test]
     fn test_explode_empty_list() -> Result<()> {
-        let mut builder = get_list_builder(&DataType::Int32, 1, 1, "a");
+        let mut builder = get_list_builder(&DataType::Int32, 1, 1, "a")?;
 
         let vals: [i32; 0] = [];
 
@@ -437,7 +442,7 @@ mod test {
     #[test]
     fn test_explode_empty_list_slot() -> Result<()> {
         // primitive
-        let mut builder = get_list_builder(&DataType::Int32, 5, 5, "a");
+        let mut builder = get_list_builder(&DataType::Int32, 5, 5, "a")?;
         builder.append_series(&Series::new("", &[1i32, 2]));
         builder.append_series(&Int32Chunked::from_slice("", &[]).into_series());
         builder.append_series(&Series::new("", &[3i32]));
@@ -450,7 +455,7 @@ mod test {
         );
 
         // more primitive
-        let mut builder = get_list_builder(&DataType::Int32, 5, 5, "a");
+        let mut builder = get_list_builder(&DataType::Int32, 5, 5, "a")?;
         builder.append_series(&Series::new("", &[1i32]));
         builder.append_series(&Int32Chunked::from_slice("", &[]).into_series());
         builder.append_series(&Series::new("", &[2i32]));
@@ -465,7 +470,7 @@ mod test {
         );
 
         // utf8
-        let mut builder = get_list_builder(&DataType::Utf8, 5, 5, "a");
+        let mut builder = get_list_builder(&DataType::Utf8, 5, 5, "a")?;
         builder.append_series(&Series::new("", &["abc"]));
         builder.append_series(
             &<Utf8Chunked as NewChunkedArray<Utf8Type, &str>>::from_slice("", &[]).into_series(),
@@ -487,7 +492,7 @@ mod test {
         );
 
         // boolean
-        let mut builder = get_list_builder(&DataType::Boolean, 5, 5, "a");
+        let mut builder = get_list_builder(&DataType::Boolean, 5, 5, "a")?;
         builder.append_series(&Series::new("", &[true]));
         builder.append_series(&BooleanChunked::from_slice("", &[]).into_series());
         builder.append_series(&Series::new("", &[false]));

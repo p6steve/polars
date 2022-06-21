@@ -7,6 +7,25 @@ impl fmt::Debug for LogicalPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use LogicalPlan::*;
         match self {
+            #[cfg(feature = "python")]
+            PythonScan { .. } => write!(f, "PYTHON SCAN"),
+            AnonymousScan {
+                schema,
+                predicate,
+                options,
+                ..
+            } => {
+                let total_columns = schema.len();
+                let mut n_columns = "*".to_string();
+                if let Some(columns) = &options.with_columns {
+                    n_columns = format!("{}", columns.len());
+                }
+                write!(
+                    f,
+                    "{}; PROJECT {}/{} COLUMNS; SELECTION: {:?}",
+                    options.fmt_str, n_columns, total_columns, predicate
+                )
+            }
             Union { inputs, .. } => write!(f, "UNION {:?}", inputs),
             Cache { input } => write!(f, "CACHE {:?}", input),
             #[cfg(feature = "parquet")]
@@ -229,15 +248,23 @@ impl fmt::Debug for Expr {
                 }
             }
             Cast {
-                expr, data_type, ..
-            } => write!(f, "{:?}.cast({:?})", expr, data_type),
+                expr,
+                data_type,
+                strict,
+            } => {
+                if *strict {
+                    write!(f, "{:?}.strict_cast({:?})", expr, data_type)
+                } else {
+                    write!(f, "{:?}.cast({:?})", expr, data_type)
+                }
+            }
             Ternary {
                 predicate,
                 truthy,
                 falsy,
             } => write!(
                 f,
-                "\nWHEN {:?}\n\t{:?}\nOTHERWISE\n\t{:?}",
+                "\nWHEN {:?}\nTHEN\n\t{:?}\nOTHERWISE\n\t{:?}",
                 predicate, truthy, falsy
             ),
             AnonymousFunction { input, options, .. } | Function { input, options, .. } => {

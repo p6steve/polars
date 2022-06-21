@@ -6,14 +6,17 @@ use crate::csv_core::parser::{
 };
 use crate::mmap::{MmapBytesReader, ReaderBytes};
 use crate::prelude::NullValues;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use polars_core::datatypes::PlHashSet;
 use polars_core::prelude::*;
+#[cfg(feature = "polars-time")]
 use polars_time::chunkedarray::utf8::infer as date_infer;
+#[cfg(feature = "polars-time")]
 use polars_time::prelude::utf8::Pattern;
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
 use std::io::Read;
+use std::mem::MaybeUninit;
 
 pub(crate) fn get_file_chunks(
     bytes: &[u8],
@@ -75,16 +78,18 @@ pub fn get_reader_bytes<R: Read + MmapBytesReader>(reader: &mut R) -> Result<Rea
     }
 }
 
-lazy_static! {
-    static ref FLOAT_RE: Regex =
-        Regex::new(r"^(\s*-?((\d*\.\d+)[eE]?[-\+]?\d*)|[-+]?inf|[-+]?NaN|\d+[eE][-+]\d+)$")
-            .unwrap();
-    static ref INTEGER_RE: Regex = Regex::new(r"^\s*-?(\d+)$").unwrap();
-    static ref BOOLEAN_RE: Regex = RegexBuilder::new(r"^\s*(true)$|^(false)$")
+static FLOAT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(\s*-?((\d*\.\d+)[eE]?[-\+]?\d*)|[-+]?inf|[-+]?NaN|\d+[eE][-+]\d+)$").unwrap()
+});
+
+static INTEGER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*-?(\d+)$").unwrap());
+
+static BOOLEAN_RE: Lazy<Regex> = Lazy::new(|| {
+    RegexBuilder::new(r"^\s*(true)$|^(false)$")
         .case_insensitive(true)
         .build()
-        .unwrap();
-}
+        .unwrap()
+});
 
 /// Infer the data type of a record
 fn infer_field_schema(string: &str, parse_dates: bool) -> DataType {
@@ -92,12 +97,19 @@ fn infer_field_schema(string: &str, parse_dates: bool) -> DataType {
     // Utf8 for them
     if string.starts_with('"') {
         if parse_dates {
-            match date_infer::infer_pattern_single(&string[1..string.len() - 1]) {
-                Some(Pattern::DatetimeYMD | Pattern::DatetimeDMY) => {
-                    DataType::Datetime(TimeUnit::Microseconds, None)
+            #[cfg(feature = "polars-time")]
+            {
+                match date_infer::infer_pattern_single(&string[1..string.len() - 1]) {
+                    Some(Pattern::DatetimeYMD | Pattern::DatetimeDMY) => {
+                        DataType::Datetime(TimeUnit::Microseconds, None)
+                    }
+                    Some(Pattern::DateYMD | Pattern::DateDMY) => DataType::Date,
+                    None => DataType::Utf8,
                 }
-                Some(Pattern::DateYMD | Pattern::DateDMY) => DataType::Date,
-                None => DataType::Utf8,
+            }
+            #[cfg(not(feature = "polars-time"))]
+            {
+                panic!("activate one of {{'dtype-date', 'dtype-datetime', dtype-time'}} features")
             }
         } else {
             DataType::Utf8
@@ -111,12 +123,19 @@ fn infer_field_schema(string: &str, parse_dates: bool) -> DataType {
     } else if INTEGER_RE.is_match(string) {
         DataType::Int64
     } else if parse_dates {
-        match date_infer::infer_pattern_single(string) {
-            Some(Pattern::DatetimeYMD | Pattern::DatetimeDMY) => {
-                DataType::Datetime(TimeUnit::Microseconds, None)
+        #[cfg(feature = "polars-time")]
+        {
+            match date_infer::infer_pattern_single(string) {
+                Some(Pattern::DatetimeYMD | Pattern::DatetimeDMY) => {
+                    DataType::Datetime(TimeUnit::Microseconds, None)
+                }
+                Some(Pattern::DateYMD | Pattern::DateDMY) => DataType::Date,
+                None => DataType::Utf8,
             }
-            Some(Pattern::DateYMD | Pattern::DateDMY) => DataType::Date,
-            None => DataType::Utf8,
+        }
+        #[cfg(not(feature = "polars-time"))]
+        {
+            panic!("activate one of {{'dtype-date', 'dtype-datetime', dtype-time'}} features")
         }
     } else {
         DataType::Utf8
@@ -233,6 +252,25 @@ pub fn infer_file_schema(
             }
             column_names
         }
+    } else if has_header && !bytes.is_empty() {
+        // there was no new line char. So we copy the whole buf and add one
+        // this is likely to be cheap as there no rows.
+        let mut buf = Vec::with_capacity(bytes.len() + 2);
+        buf.extend_from_slice(bytes);
+        buf.push(b'\n');
+
+        return infer_file_schema(
+            &ReaderBytes::Owned(buf),
+            delimiter,
+            max_read_lines,
+            has_header,
+            schema_overwrite,
+            skip_rows,
+            comment_char,
+            quote_char,
+            null_values,
+            parse_dates,
+        );
     } else {
         return Err(PolarsError::NoData("empty csv".into()));
     };
@@ -415,7 +453,7 @@ fn decompress_impl<R: Read>(
     let chunk_size = 4096;
     Some(match n_rows {
         None => {
-            // decompression will likely be an order of maginitude larger
+            // decompression will likely be an order of magnitude larger
             let mut out = Vec::with_capacity(bytes.len() * 10);
             decoder.read_to_end(&mut out).ok()?;
             out
@@ -437,7 +475,7 @@ fn decompress_impl<R: Read>(
                     if read == 0 {
                         break;
                     }
-                    // now that we have enough, we compute the number of fields (also takes enmbedding into account)
+                    // now that we have enough, we compute the number of fields (also takes embedding into account)
                     expected_fields = SplitFields::new(&out, delimiter, quote_char)
                         .into_iter()
                         .count();
@@ -503,7 +541,7 @@ pub(crate) fn decompress(
 /// The caller must ensure that:
 ///     - Output buffer must have enough capacity to hold `bytes.len()`
 ///     - bytes ends with the quote character e.g.: `"`
-pub(super) unsafe fn escape_field(bytes: &[u8], quote: u8, buf: &mut [u8]) -> usize {
+pub(super) unsafe fn escape_field(bytes: &[u8], quote: u8, buf: &mut [MaybeUninit<u8>]) -> usize {
     let mut prev_quote = false;
 
     let mut count = 0;
@@ -511,14 +549,14 @@ pub(super) unsafe fn escape_field(bytes: &[u8], quote: u8, buf: &mut [u8]) -> us
         if *c == quote {
             if prev_quote {
                 prev_quote = false;
-                *buf.get_unchecked_mut(count) = *c;
+                buf.get_unchecked_mut(count).write(*c);
                 count += 1;
             } else {
                 prev_quote = true;
             }
         } else {
             prev_quote = false;
-            *buf.get_unchecked_mut(count) = *c;
+            buf.get_unchecked_mut(count).write(*c);
             count += 1;
         }
     }
